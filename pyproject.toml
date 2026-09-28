@@ -1,0 +1,46 @@
+[project]
+name = "recirculation"
+version = "0.1.0"
+description = "Research reproduction and experiments with DeepMind's Recirculation method"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# Preserve the core versions from the previous working environment.
+dependencies = [
+    "accelerate==1.15.0",
+    "transformers==5.17.0",
+]
+
+[project.optional-dependencies]
+# Select the build per machine, as in the deep-q-learning project.
+# CPU-only: uv sync --extra cpu; NVIDIA GPU: uv sync --extra cuda.
+cpu = ["torch==2.14.0"]
+cuda = ["torch==2.14.0"]
+
+[dependency-groups]
+dev = [
+    "ipykernel==7.3.0",
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false
+conflicts = [
+    [{ extra = "cpu" }, { extra = "cuda" }],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cuda", extra = "cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+# Match deep-q-learning's CUDA 12.6 backend.
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
