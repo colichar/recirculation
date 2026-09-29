@@ -92,13 +92,16 @@ def test_warmup_and_paired_passes_commit_only_recirculated_prefix(layer_pair, bl
     assert layer.get_seq_length() == len(committed_tokens)
 
 
-# Reproduction (window=4, with or without past recording):
-# previously stored [10, 20], incoming [30], commit_tokens=1;
-# expected stored [10, 20, 30], actual stored [10, 20], reported length 3.
-# Intended invariant: attention KV = previous stored KV + all incoming KV;
-# committed KV = previous stored KV + incoming KV[:commit_tokens];
-# stored KV = last window-1 committed tokens (all when recording past).
-# This standalone commit is outside the current equal-K paired-pass schedule.
+# Sliding partial commits currently assume the incoming block follows the project's
+# fixed 2K schedule: the first K tokens are committed and the final K tokens are warmup-only,
+# so the implementation removes `commit_tokens` tokens from the end of the combined states.
+#
+# Example:
+# Previously stored [10, 20], incoming [30], commit_tokens=1;
+# expected stored [10, 20, 30], actual stored [10, 20], reported length 3. 
+#
+# A standalone partial commit such as incoming=[30], commit_tokens=1 therefore does not
+# preserve the incoming token, but this execution pattern is not expected in this project.
 @pytest.mark.parametrize("record_past", [False, True])
 @pytest.mark.xfail(
     strict=True,

@@ -20,3 +20,13 @@ uv sync --extra cuda    # NVIDIA GPU with a CUDA 12.6-compatible driver
 Otherwise, Accelerate's dependency on PyTorch can select a different build.
 
 For VSCode notebooks, select `.venv/bin/python` as the kernel.
+
+## Running tests
+
+From the repository root:
+
+```bash
+uv run --extra cpu python -m pytest tests -q
+```
+
+Use `--extra cuda` instead if that is your installed backend.
