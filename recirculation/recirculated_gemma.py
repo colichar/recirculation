@@ -5,7 +5,7 @@ from recirculated_cache import RecirculationDynamicCache
 
 
 class RecirculatedGemma:
-    def __init__(self, source=11, destination=4, alpha=0.25, model_name="google/gemma-3-1b-it"):
+    def __init__(self, source=11, destination=4, alpha=0.25, model_name="google/gemma-3-1b-it", dtype: torch.dtype = torch.float32):
         self.source = source
         self.destination = destination
         self.alpha = alpha
@@ -13,8 +13,7 @@ class RecirculatedGemma:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained( 
             model_name,
-            #torch_dtype=torch.bfloat16,
-            torch_dtype=torch.float32,
+            torch_dtype=dtype,
             device_map="auto",
         )
         self.model.eval()

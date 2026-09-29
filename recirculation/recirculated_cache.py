@@ -113,6 +113,7 @@ RECIRCULATION_LAYER_TYPE_MAPPING = {
     "sliding_attention": RecirculationDynamicSlidingWindowLayer,
 }
 
+# TODO: Restore lazy layer creation if config-free cache use is needed.
 class RecirculationDynamicCache(Cache):
     def __init__(
         self,
