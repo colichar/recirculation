@@ -16,18 +16,23 @@ class RecirculationDynamicLayer(DynamicLayer):
         self, key_states: torch.Tensor, value_states: torch.Tensor, commit_tokens: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Return the necessary keys and value states and cache only the recirculated keys and values.
+        Return KV for current attention and retain only committed tokens.
         Cases:
             - commit_tokens == None:            Prefill warmup lower layers forward pass for all tokens.
-            - commit_tokens == 0:               Warmup upper layer forward pass for first token.
+            - commit_tokens == 0:               Noncommitting pass, including initial upper-layer warmup.
             - commit_tokens == block size K:    2*K token forward pass, with first K tokens being recirculated
                                                 and the other K tokens being warmed up.
         Args:
             key_states (`torch.Tensor`): The new key states to cache.
             value_states (`torch.Tensor`): The new value states to cache.
+            commit_tokens (`int`, optional): None commits all incoming tokens; 0 commits none.
+                Positive K is supported only for paired passes with exactly 2*K incoming tokens:
+                commit the first K recirculated tokens and leave the next K uncommitted.
+                Standalone final-token commits are outside the project scope.
 
         Returns:
-            tuple[`torch.Tensor`, `torch.Tensor`]: The key and value states.
+            tuple[`torch.Tensor`, `torch.Tensor`]: Previously stored KV plus all incoming KV,
+                including uncommitted tokens needed for current attention.
         """
         # Lazy initialization
         if not self.is_initialized:
@@ -58,14 +63,22 @@ class RecirculationDynamicSlidingWindowLayer(DynamicSlidingWindowLayer):
         self, key_states: torch.Tensor, value_states: torch.Tensor, commit_tokens: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Update the key and value caches in-place, and return the necessary keys and value states.
+        Return KV for current attention and retain committed KV within the sliding window.
+
+        Retain at most sliding_window - 1 committed tokens, or all committed tokens when
+        recording past states until crop is called.
 
         Args:
             key_states (`torch.Tensor`): The new key states to cache.
             value_states (`torch.Tensor`): The new value states to cache.
+            commit_tokens (`int`, optional): None commits all incoming tokens; 0 commits none.
+                Positive K is supported only for paired passes with exactly 2*K incoming tokens:
+                commit the first K recirculated tokens and leave the next K uncommitted.
+                Standalone final-token commits are outside the project scope.
 
         Returns:
-            tuple[`torch.Tensor`, `torch.Tensor`]: The key and value states.
+            tuple[`torch.Tensor`, `torch.Tensor`]: Previously stored KV plus all incoming KV,
+                before window eviction and including uncommitted tokens for current attention.
         """
         # Lazy initialization
         if not self.is_initialized:
@@ -113,8 +126,18 @@ RECIRCULATION_LAYER_TYPE_MAPPING = {
     "sliding_attention": RecirculationDynamicSlidingWindowLayer,
 }
 
-# TODO: Restore lazy layer creation if config-free cache use is needed.
 class RecirculationDynamicCache(Cache):
+    """Cache for the project's paired-pass Recirculation schedule.
+
+    Always construct this cache with a model config. Config-free initialization is
+    outside the project scope, despite the optional constructor signature.
+
+    Set commit_tokens to None to commit all incoming tokens, or 0 to commit none.
+    Partial commits use exactly 2*K incoming tokens: the first K are recirculated
+    and committed, while the next K are warmed up and remain uncommitted.
+    Standalone final-token commits are outside the project scope.
+    """
+
     def __init__(
         self,
         ddp_cache_data: Iterable[tuple[torch.Tensor | None, ...]] | None = None,
@@ -155,7 +178,7 @@ class RecirculationDynamicCache(Cache):
                 if key_states is not None and value_states is not None:
                     _, _ = layers[layer_idx].update(key_states, value_states)
 
-        # If neither of config nor ddp_data was passed, then simply lazy init a full cache of DynamicLayer
+        # Inherited constructor fallback; config-free use is outside the supported scope.
         if len(layers) == 0:
             super().__init__(
                 layer_class_to_replicate=RecirculationDynamicLayer,

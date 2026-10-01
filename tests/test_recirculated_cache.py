@@ -92,33 +92,6 @@ def test_warmup_and_paired_passes_commit_only_recirculated_prefix(layer_pair, bl
     assert layer.get_seq_length() == len(committed_tokens)
 
 
-# Sliding partial commits currently assume the incoming block follows the project's
-# fixed 2K schedule: the first K tokens are committed and the final K tokens are warmup-only,
-# so the implementation removes `commit_tokens` tokens from the end of the combined states.
-#
-# Example:
-# Previously stored [10, 20], incoming [30], commit_tokens=1;
-# expected stored [10, 20, 30], actual stored [10, 20], reported length 3. 
-#
-# A standalone partial commit such as incoming=[30], commit_tokens=1 therefore does not
-# preserve the incoming token, but this execution pattern is not expected in this project.
-@pytest.mark.parametrize("record_past", [False, True])
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="Sliding partial commits discard commit_tokens from the end instead of keeping the incoming prefix",
-)
-def test_sliding_single_token_commit_keeps_the_incoming_token(record_past):
-    layer = RecirculationDynamicSlidingWindowLayer(sliding_window=4)
-    if record_past:
-        layer.activate_past_recording()
-    layer.update(*token_kv([10, 20]))
-    attention_kv = layer.update(*token_kv([30]), commit_tokens=1)
-    assert_kv_equal(attention_kv, token_kv([10, 20, 30]))
-    assert layer.get_seq_length() == 3
-    assert_kv_equal((layer.keys, layer.values), token_kv([10, 20, 30]))
-
-
 @pytest.fixture
 def mixed_config():
     config = Gemma3TextConfig(
