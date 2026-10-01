@@ -42,7 +42,15 @@ class RecirculatedGemma:
             if self.model.config.layer_types[i] == "sliding_attention"
         )
 
-    def run(self, input_ids, attention_mask=None):
+    def run(self, input_ids, attention_mask=None, output_logits="first_pass"):
+        """Return per-token logits and input IDs, resetting the cache each call.
+
+        output_logits selects the readout: "first_pass" (default) is paper-faithful;
+        "recirculated_pass" uses recirculated logits for ablation studies.
+        """
+        if output_logits not in ("first_pass", "recirculated_pass"):
+            raise ValueError(f"Unknown output_logits mode: {output_logits!r}")
+
         with torch.no_grad():
             ## Empty Cache
  
@@ -103,7 +111,10 @@ class RecirculatedGemma:
                 token_position=0,
                 past_key_values=None
             )
-            self.warmup_pass(hidden_states=hidden_states[:, 0:1, :].clone())
+            warmup_state = self.warmup_pass(hidden_states=hidden_states[:, 0:1, :].clone())
+
+            if output_logits == "first_pass":
+                self.final_hidden_states.append(warmup_state)
 
             # Currently hardcoded block-size K
             K = 1
@@ -124,21 +135,25 @@ class RecirculatedGemma:
                 )
 
                 # Accumulate final hidden states
-                self.final_hidden_states.append(hidden_states_block[:, :K, :])
+                if output_logits == "first_pass":
+                    self.final_hidden_states.append(hidden_states_block[:, K:2*K, :])
+                else:
+                    self.final_hidden_states.append(hidden_states_block[:, :K, :])
 
+            # Only recirculated readout needs a separate final-token pass.
+            if output_logits == "recirculated_pass":
+                final_token = input_embeddings.shape[1] - 1
+                self.create_attention_masks(
+                    token_embedding=input_embeddings[:, final_token:final_token+1, :],
+                    attention_mask=attention_mask,
+                    token_position=final_token,
+                    past_key_values=self.past_key_values
+                )
 
-            final_token = input_embeddings.shape[1] - 1
-            self.create_attention_masks(
-                token_embedding=input_embeddings[:, final_token:final_token+1, :],
-                attention_mask=attention_mask,
-                token_position=final_token,
-                past_key_values=self.past_key_values
-            )
+                self.past_key_values.commit_tokens = 0
+                final_state = self.recirculate_token(token_position=final_token)
 
-            self.past_key_values.commit_tokens = 0
-            final_state = self.recirculate_token(token_position=final_token)
-
-            self.final_hidden_states.append(final_state)
+                self.final_hidden_states.append(final_state)
 
             final_hidden_states = torch.cat(self.final_hidden_states, dim=1)
             final_hidden_states = self.model.model.norm(final_hidden_states)
