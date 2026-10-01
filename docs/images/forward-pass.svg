@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="860" viewBox="0 0 1040 860" role="img" aria-labelledby="title desc">
+  <title id="title">Recirculation forward-pass schedule</title>
+  <desc id="desc">A four-token example of the current K equals 1 schedule. All tokens first traverse the lower layers. The upper layers warm up token zero, then process three pairs: recirculated token i and first-pass token i plus one. Only recirculated output mode needs a separate final-token pass. First-pass mode selects F zero through F three; recirculated mode selects R zero through R three.</desc>
+  <defs>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; }
+      .title { font-size: 28px; font-weight: 700; }
+      .label { font-size: 18px; font-weight: 700; }
+      .small { font-size: 16px; fill: #45566f; }
+      .token { font-size: 20px; font-weight: 700; }
+      .first { fill: #eaf3ff; stroke: #2563a6; stroke-width: 2; }
+      .recirc { fill: #fff0df; stroke: #ad5610; stroke-width: 2; }
+      .first-text { fill: #174e88; }
+      .recirc-text { fill: #90420a; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#6b7c93"/>
+    </marker>
+  </defs>
+  <rect width="1040" height="860" rx="16" fill="#ffffff"/>
+  <text x="40" y="46" class="title">Forward pass · four input tokens</text>
+  <text x="40" y="76" class="small">Current run schedule · K = 1 · execution proceeds from top to bottom</text>
+
+  <rect x="40" y="97" width="24" height="24" rx="5" class="first"/>
+  <text x="76" y="115" class="small">F = first upper-layer pass</text>
+  <rect x="322" y="97" width="24" height="24" rx="5" class="recirc"/>
+  <text x="358" y="115" class="small">R = recirculated upper-layer pass</text>
+  <text x="1000" y="115" text-anchor="end" class="small">Joined cells = one paired call</text>
+
+  <!-- Token columns stay aligned through the entire schedule. -->
+  <g text-anchor="middle" class="token">
+    <text x="390" y="159">t₀</text>
+    <text x="540" y="159">t₁</text>
+    <text x="690" y="159">t₂</text>
+    <text x="840" y="159">t₃</text>
+  </g>
+  <g stroke="#e3e9f1" stroke-dasharray="4 6">
+    <path d="M390 244 V634"/>
+    <path d="M540 244 V634"/>
+    <path d="M690 244 V634"/>
+    <path d="M840 244 V634"/>
+  </g>
+  <path d="M24 181 V617" fill="none" stroke="#6b7c93" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <text x="52" y="200" class="label">Lower-layer prefill</text>
+  <text x="52" y="225" class="small">Layers 0 to destination</text>
+  <rect x="330" y="178" width="570" height="58" rx="10" fill="#f0f4f8" stroke="#6b7c93" stroke-width="2"/>
+  <text x="615" y="203" text-anchor="middle" class="label">All tokens · one causal prefill</text>
+  <text x="615" y="225" text-anchor="middle" class="small">Keep lower-layer outputs for upper passes</text>
+
+  <text x="52" y="280" class="small">Upper layyers from destination+1 to last layer</text>
+  <text x="52" y="329" class="label">0th token warmup</text>
+  <rect x="330" y="300" width="120" height="48" rx="9" class="first"/>
+  <text x="390" y="331" text-anchor="middle" class="token first-text">F₀</text>
+
+  <!-- Each outline encloses one recirculated token and one new token. -->
+  <text x="52" y="397" class="label">1st Pair (Tokens 0 and 1)</text>
+  <rect x="320" y="358" width="290" height="68" rx="14" fill="#f8fafc" stroke="#c3cedc"/>
+  <path d="M450 392 H480" stroke="#6b7c93" stroke-width="2"/>
+  <rect x="330" y="368" width="120" height="48" rx="9" class="recirc"/>
+  <rect x="480" y="368" width="120" height="48" rx="9" class="first"/>
+  <text x="390" y="399" text-anchor="middle" class="token recirc-text">R₀</text>
+  <text x="540" y="399" text-anchor="middle" class="token first-text">F₁</text>
+
+  <text x="52" y="465" class="label">2nd Pair (Tokens 1 and 2)</text>
+  <rect x="470" y="426" width="290" height="68" rx="14" fill="#f8fafc" stroke="#c3cedc"/>
+  <path d="M600 460 H630" stroke="#6b7c93" stroke-width="2"/>
+  <rect x="480" y="436" width="120" height="48" rx="9" class="recirc"/>
+  <rect x="630" y="436" width="120" height="48" rx="9" class="first"/>
+  <text x="540" y="467" text-anchor="middle" class="token recirc-text">R₁</text>
+  <text x="690" y="467" text-anchor="middle" class="token first-text">F₂</text>
+
+  <text x="52" y="533" class="label">3rd Pair (Tokens 2 and 3)</text>
+  <rect x="620" y="494" width="290" height="68" rx="14" fill="#f8fafc" stroke="#c3cedc"/>
+  <path d="M750 528 H780" stroke="#6b7c93" stroke-width="2"/>
+  <rect x="630" y="504" width="120" height="48" rx="9" class="recirc"/>
+  <rect x="780" y="504" width="120" height="48" rx="9" class="first"/>
+  <text x="690" y="535" text-anchor="middle" class="token recirc-text">R₂</text>
+  <text x="840" y="535" text-anchor="middle" class="token first-text">F₃</text>
+
+  <text x="52" y="601" class="label">Optional final pass</text>
+  <text x="52" y="626" class="small">Recirculated readout only without KV commit</text>
+  <rect x="780" y="572" width="120" height="48" rx="9" class="recirc" stroke-dasharray="6 4"/>
+  <text x="840" y="603" text-anchor="middle" class="token recirc-text">R₃</text>
+
+  <text x="40" y="666" class="label">Select upper-layer outputs in token order</text>
+  <rect x="40" y="682" width="465" height="82" rx="10" class="first"/>
+  <text x="60" y="711" class="label first-text">first_pass · default / paper-faithful</text>
+  <text x="60" y="742" class="token first-text">F₀ → F₁ → F₂ → F₃</text>
+  <rect x="525" y="682" width="475" height="82" rx="10" class="recirc"/>
+  <text x="545" y="711" class="label recirc-text">recirculated_pass · ablation</text>
+  <text x="545" y="742" class="token recirc-text">R₀ → R₁ → R₂ → R₃</text>
+
+  <rect x="40" y="786" width="960" height="46" rx="10" fill="#f0f4f8"/>
+  <text x="520" y="815" text-anchor="middle" class="label">Selected states → final norm → LM head → per-token logits</text>
+</svg>

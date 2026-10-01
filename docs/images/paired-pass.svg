@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="888" viewBox="0 0 1040 888" role="img" aria-labelledby="title desc">
+  <title id="title">Inside a paired Recirculation pass</title>
+  <desc id="desc">Mix the previous token's first-pass destination state with its norm-matched first-pass source state. Pair this recirculated input with the new token's unchanged destination state. Process both through the upper layers in one causal call. Commit only the previous token's recirculated KV and save the new token's first-pass source and destination states for the next pair.</desc>
+  <defs>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; }
+      .title { font-size: 28px; font-weight: 700; }
+      .label { font-size: 20px; font-weight: 700; }
+      .body { font-size: 18px; }
+      .small { font-size: 16px; fill: #45566f; }
+      .math { font-family: 'DejaVu Sans Mono', monospace; font-size: 17px; }
+      .first { fill: #eaf3ff; stroke: #2563a6; stroke-width: 2; }
+      .recirc { fill: #fff0df; stroke: #ad5610; stroke-width: 2; }
+      .first-text { fill: #174e88; }
+      .recirc-text { fill: #90420a; }
+      .flow { fill: none; stroke: #6b7c93; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#6b7c93"/>
+    </marker>
+  </defs>
+  <rect width="1040" height="888" rx="16" fill="#ffffff"/>
+  <text x="40" y="46" class="title">Inside one paired pass</text>
+  <text x="40" y="76" class="small">K = 1, d = destination layer, s = source layer, h denotes a first-pass state</text>
+
+  <text x="260" y="117" text-anchor="middle" class="label recirc-text">Previous token · tᵢ</text>
+  <text x="780" y="117" text-anchor="middle" class="label first-text">New token · tᵢ₊₁</text>
+
+  <rect x="40" y="136" width="440" height="80" rx="10" fill="#f0f4f8" stroke="#c3cedc"/>
+  <text x="260" y="166" text-anchor="middle" class="label">Saved first-pass states</text>
+  <text x="260" y="197" text-anchor="middle" class="math">h_d,i and h_s,i</text>
+  <rect x="560" y="136" width="440" height="80" rx="10" fill="#f0f4f8" stroke="#c3cedc"/>
+  <text x="780" y="166" text-anchor="middle" class="label">Lower-layer prefill output</text>
+  <text x="780" y="197" text-anchor="middle" class="math">h_d,i+1</text>
+
+  <path d="M260 216 V246" class="flow"/>
+  <path d="M780 216 V246" class="flow"/>
+  <rect x="40" y="248" width="440" height="106" rx="10" class="recirc"/>
+  <text x="260" y="278" text-anchor="middle" class="label recirc-text">Norm-match, then mix</text>
+  <text x="260" y="307" text-anchor="middle" class="math">(1 − α) h_d,i + α · scaled(h_s,i)</text>
+  <text x="260" y="335" text-anchor="middle" class="small">Scale source to the destination state's L2 norm</text>
+  <rect x="560" y="248" width="440" height="106" rx="10" class="first"/>
+  <text x="780" y="278" text-anchor="middle" class="label first-text">Use destination state unchanged</text>
+  <text x="780" y="307" text-anchor="middle" class="math">h_d,i+1</text>
+  <text x="780" y="335" text-anchor="middle" class="small">This token has not traversed the upper layers yet</text>
+  <path d="M260 354 V394" class="flow"/>
+  <path d="M780 354 V394" class="flow"/>
+
+  <!-- Both token lanes belong to the same causal upper-layer call. -->
+  <rect x="40" y="396" width="960" height="224" rx="14" fill="#f8fafc" stroke="#6b7c93" stroke-width="2"/>
+  <text x="520" y="427" text-anchor="middle" class="label">PAIRED-TOKEN UPPER-LAYER CALL</text>
+  <text x="520" y="451" text-anchor="middle" class="small">Layers d + 1…last · original token positions</text>
+  <rect x="70" y="470" width="410" height="62" rx="9" class="recirc"/>
+  <rect x="560" y="470" width="410" height="62" rx="9" class="first"/>
+  <text x="275" y="507" text-anchor="middle" class="label recirc-text">Recirculated token → Rᵢ</text>
+  <text x="765" y="507" text-anchor="middle" class="label first-text">First-pass token → Fᵢ₊₁</text>
+  <text x="520" y="564" text-anchor="middle" class="body">At each layer: retained past KV + both tokens' current KV</text>
+  <text x="520" y="595" text-anchor="middle" class="small">Causal / sliding mask: new token can attend to previous token, never the reverse</text>
+
+  <path d="M260 620 V654" class="flow"/>
+  <path d="M780 620 V654" class="flow"/>
+  <rect x="40" y="656" width="440" height="136" rx="10" class="recirc"/>
+  <text x="60" y="688" class="label recirc-text">Commit recirculated KV</text>
+  <text x="60" y="718" class="body">Retain tᵢ's upper-layer KV for later passes.</text>
+  <text x="60" y="746" class="small">Rᵢ supplies the recirculated-mode readout.</text>
+  <text x="60" y="774" class="small">Sliding-window eviction still applies.</text>
+  <rect x="560" y="656" width="440" height="136" rx="10" class="first"/>
+  <text x="580" y="688" class="label first-text">Save pending first-pass states</text>
+  <text x="580" y="718" class="body">Keep h_d,i+1 and h_s,i+1 for the next pair.</text>
+  <text x="580" y="746" class="small">Fᵢ₊₁ supplies the first-pass-mode readout.</text>
+  <text x="580" y="774" class="small">This token's upper-layer KV is not retained.</text>
+
+  <rect x="40" y="818" width="960" height="46" rx="10" fill="#f0f4f8"/>
+  <text x="520" y="847" text-anchor="middle" class="body">Readout selection changes which states become logits; the paired computation is the same.</text>
+</svg>
