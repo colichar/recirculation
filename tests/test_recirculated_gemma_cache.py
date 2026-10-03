@@ -33,6 +33,21 @@ def tiny_gemma(monkeypatch):
     return module.RecirculatedGemma(source=2, destination=0)
 
 
+def test_run_requires_attention_mask(tiny_gemma):
+    input_ids = torch.tensor([[2, 3]])
+    with pytest.raises(TypeError, match="attention_mask"):
+        tiny_gemma.run(input_ids)
+
+
+def test_run_rejects_none_mask_before_computation(tiny_gemma, monkeypatch):
+    def unexpected_embedding(*args, **kwargs):
+        pytest.fail("Missing masks must be rejected before model computation")
+
+    monkeypatch.setattr(tiny_gemma.model.model.embed_tokens, "forward", unexpected_embedding)
+    with pytest.raises(ValueError, match="attention_mask must not be None"):
+        tiny_gemma.run(torch.tensor([[2, 3]]), attention_mask=None)
+
+
 @pytest.mark.parametrize("length", [1, 7])
 @pytest.mark.parametrize("output_logits", ["first_pass", "recirculated_pass"])
 def test_zero_alpha_matches_vanilla_across_sliding_window(tiny_gemma, length, output_logits):
