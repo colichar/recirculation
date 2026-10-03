@@ -42,12 +42,20 @@ class RecirculatedGemma:
             if self.model.config.layer_types[i] == "sliding_attention"
         )
 
-    def run(self, input_ids, attention_mask=None, output_logits="first_pass"):
+    def run(self, input_ids, attention_mask, output_logits="first_pass"):
         """Return per-token logits and input IDs, resetting the cache each call.
+
+        attention_mask is required and must not be None. Pass a mask of shape
+        (batch_size, sequence_length), with 1 for valid tokens and 0 for padding;
+        use an all-ones mask for unpadded inputs. Causal and sliding-window
+        restrictions are applied internally.
 
         output_logits selects the readout: "first_pass" (default) is paper-faithful;
         "recirculated_pass" uses recirculated logits for ablation studies.
         """
+        if attention_mask is None:
+            raise ValueError("attention_mask must not be None; use an all-ones mask for unpadded inputs.")
+
         if output_logits not in ("first_pass", "recirculated_pass"):
             raise ValueError(f"Unknown output_logits mode: {output_logits!r}")
 
