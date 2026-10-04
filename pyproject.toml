@@ -41,6 +41,6 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
-# Match deep-q-learning's CUDA 12.6 backend.
-url = "https://download.pytorch.org/whl/cu126"
+# CUDA 13.0 backend.
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
