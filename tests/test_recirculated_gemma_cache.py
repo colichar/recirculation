@@ -6,8 +6,35 @@ import torch
 from transformers import Gemma3ForCausalLM, Gemma3TextConfig
 
 
+execution_cases = pytest.mark.parametrize(
+    "tiny_gemma",
+    [("cpu", torch.float32), ("cuda", torch.float32), ("cuda", torch.bfloat16)],
+    ids=["cpu-fp32", "cuda-fp32", "cuda-bf16"],
+    indirect=True,
+)
+
+
+def assert_logits_close(actual, expected, *, rtol=1e-5, atol=1e-6):
+    # Compare values in FP32 even if one forward path upcasts its logits.
+    actual, expected = actual.float(), expected.float()
+    difference = (actual - expected).abs()
+    # Normalize by the global logit scale, not individual near-zero logits.
+    scaled = difference.max() / expected.abs().max().clamp_min(torch.finfo(torch.float32).eps)
+    print(f"max_abs={difference.max().item():.8g} mean_abs={difference.mean().item():.8g} "
+          f"max_abs/scale={scaled.item():.8g}")
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
 @pytest.fixture
-def tiny_gemma(monkeypatch):
+def tiny_gemma(monkeypatch, request):
+    device, dtype = getattr(request, "param", ("cpu", torch.float32))
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is unavailable")
+        if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported(including_emulation=False):
+            pytest.skip("CUDA device does not support native BF16")
+        # Validate FP32 with IEEE matmul rather than TF32; restore after each test.
+        monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
     # The research module currently uses a sibling import when run as a script.
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "recirculation"))
     module = importlib.import_module("recirculated_gemma")
@@ -29,8 +56,22 @@ def tiny_gemma(monkeypatch):
         model = Gemma3ForCausalLM(config).eval()
     # Exercise the real wrapper initialization without downloading weights or a tokenizer.
     monkeypatch.setattr(module.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: None)
-    monkeypatch.setattr(module.AutoModelForCausalLM, "from_pretrained", lambda *args, **kwargs: model)
-    return module.RecirculatedGemma(source=2, destination=0)
+    def load_model(*args, **kwargs):
+        assert kwargs["torch_dtype"] == dtype
+        return model.to(device=device, dtype=kwargs["torch_dtype"])
+
+    monkeypatch.setattr(module.AutoModelForCausalLM, "from_pretrained", load_model)
+    wrapper = module.RecirculatedGemma(source=2, destination=0, dtype=dtype)
+    for parameter in wrapper.model.parameters():
+        assert parameter.device.type == device
+        assert parameter.dtype == dtype
+    yield wrapper
+    # Check actual execution storage, including noncommitting single-token passes.
+    if wrapper.past_key_values is not None:
+        for layer in wrapper.past_key_values.layers:
+            for tensor in (layer.keys, layer.values):
+                assert tensor.device.type == device
+                assert tensor.dtype == dtype
 
 
 def test_run_requires_attention_mask(tiny_gemma):
@@ -48,33 +89,43 @@ def test_run_rejects_none_mask_before_computation(tiny_gemma, monkeypatch):
         tiny_gemma.run(torch.tensor([[2, 3]]), attention_mask=None)
 
 
-@pytest.mark.parametrize("length", [1, 7])
+@execution_cases
+@pytest.mark.parametrize("length", [1, 7, 13])
 @pytest.mark.parametrize("output_logits", ["first_pass", "recirculated_pass"])
 def test_zero_alpha_matches_vanilla_across_sliding_window(tiny_gemma, length, output_logits):
     tiny_gemma.alpha = 0.0
-    input_ids = torch.arange(2, 2 + length).unsqueeze(0)
+    input_ids = torch.arange(2, 2 + length, device=tiny_gemma.model.device).unsqueeze(0)
     attention_mask = torch.ones_like(input_ids)
     expected, _ = tiny_gemma.run_vanilla(input_ids, attention_mask)
     actual, _ = tiny_gemma.run(input_ids, attention_mask, output_logits=output_logits)
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    # BF16 allows approximately one rounding unit across different execution
+    # schedules. Evidence and the tighter invariant tolerances are in
+    # docs/numerical-validation.md.
+    if tiny_gemma.model.dtype == torch.bfloat16:
+        assert_logits_close(actual, expected, rtol=1e-2, atol=1e-5)
+    else:
+        assert_logits_close(actual, expected)
 
 
+@execution_cases
 @pytest.mark.parametrize("output_logits", ["first_pass", "recirculated_pass"])
 def test_future_tokens_do_not_change_earlier_logits(tiny_gemma, output_logits):
     tiny_gemma.alpha = 0.25
-    input_ids = torch.tensor([[2, 3, 4, 5, 6, 7, 8]])
-    changed_ids = torch.tensor([[2, 3, 4, 5, 6, 20, 21]])
+    input_ids = torch.arange(2, 15, device=tiny_gemma.model.device).unsqueeze(0)
+    changed_ids = input_ids.clone()
+    changed_ids[:, 11:] = torch.tensor([20, 21], device=input_ids.device)
     mask = torch.ones_like(input_ids)
     original, _ = tiny_gemma.run(input_ids, mask, output_logits=output_logits)
     changed, _ = tiny_gemma.run(changed_ids, mask, output_logits=output_logits)
     # Valid for either first-pass or recirculated readout: no future-token leakage.
-    torch.testing.assert_close(original[:, :5], changed[:, :5], rtol=1e-5, atol=1e-6)
+    assert_logits_close(original[:, :11], changed[:, :11])
 
 
+@execution_cases
 @pytest.mark.parametrize("length", [1, 7])
 def test_nonzero_alpha_selects_pass_outputs(tiny_gemma, monkeypatch, length):
     tiny_gemma.alpha = 0.25
-    input_ids = torch.arange(2, 2 + length).unsqueeze(0)
+    input_ids = torch.arange(2, 2 + length, device=tiny_gemma.model.device).unsqueeze(0)
     mask = torch.ones_like(input_ids)
     first_pass_states = []
     recirculated_states = []
@@ -117,7 +168,7 @@ def test_nonzero_alpha_selects_pass_outputs(tiny_gemma, monkeypatch, length):
     default, _ = tiny_gemma.run(input_ids, mask)
     assert first.shape == recirculated.shape == (1, length, tiny_gemma.model.config.vocab_size)
     # Compare all positions, including the warmup and final-token boundaries.
-    torch.testing.assert_close(first, expected_first, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(recirculated, expected_recirculated, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(default, first, rtol=1e-5, atol=1e-6)
+    assert_logits_close(first, expected_first)
+    assert_logits_close(recirculated, expected_recirculated)
+    assert_logits_close(default, first)
     assert not torch.allclose(expected_first, expected_recirculated, rtol=1e-5, atol=1e-6)

@@ -64,7 +64,7 @@ To install the dependencies, run one of the following commands from the reposito
 
 ```bash
 uv sync --extra cpu     # CPU-only machine
-uv sync --extra cuda    # NVIDIA GPU with a CUDA 12.6-compatible driver
+uv sync --extra cuda    # NVIDIA GPU with a CUDA 13.0-compatible driver
 ```
 
 **Note:** Always pass `--extra cpu` or `--extra cuda` to `uv sync` and `uv run`.
@@ -81,3 +81,7 @@ uv run --extra cpu python -m pytest tests -q
 ```
 
 Use `--extra cuda` instead if that is your installed backend.
+
+Gemma integration checks cover CPU FP32, CUDA FP32, and CUDA BF16; unsupported
+hardware configurations are explicitly skipped. See
+[numerical validation](docs/numerical-validation.md) for coverage, tolerances and commands to reproduce the checks.
