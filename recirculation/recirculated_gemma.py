@@ -21,9 +21,6 @@ class RecirculatedGemma:
         self.past_key_values = None
         self.destination_hidden = None
         self.source_hidden = None
-        self.position_ids = None
-        self.causal_mask_mapping = None
-        self.position_embeddings = {}
 
         self.final_hidden_states = []
 
@@ -42,7 +39,16 @@ class RecirculatedGemma:
             if self.model.config.layer_types[i] == "sliding_attention"
         )
 
-    def run(self, input_ids, attention_mask, output_logits="first_pass"):
+    def run(self,
+            input_ids,
+            attention_mask,
+            output_logits="first_pass",
+            reset_cache=True,
+            input_embeddings=None,
+            position_ids=None,
+            position_embeddings=None,
+            K=1
+            ):
         """Return per-token logits and input IDs, resetting the cache each call.
 
         attention_mask is required and must not be None. Pass a mask of shape
@@ -60,43 +66,27 @@ class RecirculatedGemma:
             raise ValueError(f"Unknown output_logits mode: {output_logits!r}")
 
         with torch.no_grad():
-            ## Empty Cache
- 
-            self.past_key_values = RecirculationDynamicCache(config=self.model.config)
             self.final_hidden_states = []
 
-            ## Token Embeddings
+            if reset_cache:
+                ## Empty Cache
+                self.past_key_values = RecirculationDynamicCache(config=self.model.config)
 
-            input_embeddings = self.model.model.embed_tokens.forward(input_ids=input_ids)
+            if input_embeddings is None or position_ids is None or position_embeddings is None:
+                ## Generate Embeddings
+                input_embeddings, position_ids, position_embeddings = self.generate_embeddigs(input_ids=input_ids)
 
             hidden_states = input_embeddings.clone()
-            ## Position Embeddings
-
-            self.position_ids = torch.arange(
-                hidden_states.shape[1],
-                device=hidden_states.device
-            ).unsqueeze(0)
-
-            for layer_type in set(self.model.config.layer_types):
-                cos, sin = self.model.model.rotary_emb(
-                    hidden_states,
-                    self.position_ids,
-                    layer_type
-                )
-
-                self.position_embeddings[layer_type] = {
-                    "cos": cos,
-                    "sin": sin
-                }
 
             # Warmup all tokens
             self.past_key_values.commit_tokens = None
 
-            self.create_attention_masks(
+            causal_mask_mapping = self.create_attention_masks(
                 token_embedding=hidden_states,
                 attention_mask=attention_mask,
                 token_position=None,
-                past_key_values=self.past_key_values
+                past_key_values=self.past_key_values,
+                position_ids=position_ids
             )
 
             for layer in range(self.destination + 1):
@@ -104,42 +94,48 @@ class RecirculatedGemma:
                     
                 hidden_states = self.model.model.layers[layer].forward(
                     hidden_states=hidden_states,
-                    position_embeddings=(self.position_embeddings[layer_type]["cos"], self.position_embeddings[layer_type]["sin"]),
-                    attention_mask=self.causal_mask_mapping[layer_type],
-                    position_ids=self.position_ids,
+                    position_embeddings=(position_embeddings[layer_type]["cos"], position_embeddings[layer_type]["sin"]),
+                    attention_mask=causal_mask_mapping[layer_type],
+                    position_ids=position_ids,
                     past_key_values=self.past_key_values
                 )
 
             # Warmup first token
             self.past_key_values.commit_tokens = 0
 
-            self.create_attention_masks(
+            causal_mask_mapping = self.create_attention_masks(
                 token_embedding=hidden_states[:, 0:1, :],
                 attention_mask=attention_mask,
                 token_position=0,
-                past_key_values=None
+                past_key_values=None,
+                position_ids=position_ids
             )
-            warmup_state = self.warmup_pass(hidden_states=hidden_states[:, 0:1, :].clone())
+            warmup_state = self.warmup_pass(
+                hidden_states=hidden_states[:, 0:1, :].clone(),
+                position_ids=position_ids[:, 0:1],
+                position_embeddings=self._slice_position_embeddings(position_embeddings, start=0, end=1),
+                causal_mask_mapping=causal_mask_mapping
+            )
 
             if output_logits == "first_pass":
-                self.final_hidden_states.append(warmup_state)
-
-            # Currently hardcoded block-size K
-            K = 1
+                self.final_hidden_states.append(warmup_state)            
 
             for token_position in range(hidden_states.shape[1] - 1):
                 # Recirculate first K tokens and warmup the next K tokens
                 self.past_key_values.commit_tokens = K
-                self.create_attention_masks(
+                causal_mask_mapping = self.create_attention_masks(
                     token_embedding=hidden_states[:, token_position:token_position+2*K, :],
                     attention_mask=attention_mask,
                     token_position=token_position,
-                    past_key_values=self.past_key_values
+                    past_key_values=self.past_key_values,
+                    position_ids=position_ids
                 )
 
                 hidden_states_block = self.recirculated_block_pass(
                     hidden_states=hidden_states[:, token_position:token_position+2*K, :],
-                    token_position=token_position
+                    position_ids=position_ids[:, token_position:token_position+2*K],
+                    position_embeddings=self._slice_position_embeddings(position_embeddings, start=token_position, end=token_position+2*K),
+                    causal_mask_mapping=causal_mask_mapping
                 )
 
                 # Accumulate final hidden states
@@ -151,15 +147,20 @@ class RecirculatedGemma:
             # Only recirculated readout needs a separate final-token pass.
             if output_logits == "recirculated_pass":
                 final_token = input_embeddings.shape[1] - 1
-                self.create_attention_masks(
+                causal_mask_mapping = self.create_attention_masks(
                     token_embedding=input_embeddings[:, final_token:final_token+1, :],
                     attention_mask=attention_mask,
                     token_position=final_token,
-                    past_key_values=self.past_key_values
+                    past_key_values=self.past_key_values,
+                    position_ids=position_ids
                 )
 
                 self.past_key_values.commit_tokens = 0
-                final_state = self.recirculate_token(token_position=final_token)
+                final_state = self.recirculate_token(
+                    position_ids=position_ids[:, final_token:final_token+1],
+                    position_embeddings=self._slice_position_embeddings(position_embeddings, start=final_token, end=final_token+1),
+                    causal_mask_mapping=causal_mask_mapping
+                    )
 
                 self.final_hidden_states.append(final_state)
 
@@ -169,7 +170,23 @@ class RecirculatedGemma:
 
             return logits, input_ids
 
-    def warmup_pass(self, hidden_states):
+    def _slice_position_embeddings(self, position_embeddings, start, end):
+        sliced_position_embeddings = {}
+        for key in list(position_embeddings.keys()):
+            sliced_position_embeddings[key] = {
+                "cos": position_embeddings[key]["cos"][:, start:end],
+                "sin": position_embeddings[key]["sin"][:, start:end],
+            }
+
+        return sliced_position_embeddings
+
+    def warmup_pass(
+            self,
+            hidden_states,
+            position_ids,
+            position_embeddings,
+            causal_mask_mapping
+        ):
         """Warmup pass for first token of a sequence."""
 
         for layer in range(self.destination + 1, self.model.config.num_hidden_layers):
@@ -183,15 +200,22 @@ class RecirculatedGemma:
     
             hidden_states = self.model.model.layers[layer].forward(
                 hidden_states=hidden_states,
-                position_embeddings=(self.position_embeddings[layer_type]["cos"][:, 0:1], self.position_embeddings[layer_type]["sin"][:, 0:1]),
-                attention_mask=self.causal_mask_mapping[layer_type],
-                position_ids=self.position_ids[:, 0:1],
+                position_embeddings=(position_embeddings[layer_type]["cos"], position_embeddings[layer_type]["sin"]),
+                attention_mask=causal_mask_mapping[layer_type],
+                position_ids=position_ids,
                 past_key_values=self.past_key_values
             )
 
         return hidden_states
 
-    def recirculated_block_pass(self, hidden_states, token_position, K=1):
+    def recirculated_block_pass(
+            self,
+            hidden_states,
+            position_ids,
+            position_embeddings,
+            causal_mask_mapping,
+            K=1
+        ):
         """Recirculated pass for block size K and normal pass for the subsequent block size K.""" 
         source_scaled = self.source_hidden  * (self.destination_hidden.norm(dim=-1, keepdim=True) / self.source_hidden.norm(dim=-1, keepdim=True))
 
@@ -208,16 +232,20 @@ class RecirculatedGemma:
 
             hidden_states = self.model.model.layers[layer].forward(
                 hidden_states=hidden_states,
-                position_embeddings=(self.position_embeddings[layer_type]["cos"][:, token_position:token_position+2*K], self.position_embeddings[layer_type]["sin"][:, token_position:token_position+2*K]),
-                attention_mask=self.causal_mask_mapping[layer_type],
-                position_ids=self.position_ids[:, token_position:token_position+2*K],
+                position_embeddings=(position_embeddings[layer_type]["cos"], position_embeddings[layer_type]["sin"]),
+                attention_mask=causal_mask_mapping[layer_type],
+                position_ids=position_ids,
                 past_key_values=self.past_key_values
             )
 
         return hidden_states
-        
 
-    def recirculate_token(self, token_position):
+    def recirculate_token(
+            self,
+            position_ids,
+            position_embeddings,
+            causal_mask_mapping
+            ):
         """Recirculates hidden state from source layer to destinaton layer for first token in iteration."""
         source_scaled = self.source_hidden  * (self.destination_hidden.norm(dim=-1, keepdim=True) / self.source_hidden.norm(dim=-1, keepdim=True))
 
@@ -228,15 +256,44 @@ class RecirculatedGemma:
 
             hidden_states = self.model.model.layers[layer].forward(
                 hidden_states=hidden_states,
-                position_embeddings=(self.position_embeddings[layer_type]["cos"][:, token_position:token_position+1], self.position_embeddings[layer_type]["sin"][:, token_position:token_position+1]),
-                attention_mask=self.causal_mask_mapping[layer_type],
-                position_ids=self.position_ids[:, token_position:token_position+1],
+                position_embeddings=(position_embeddings[layer_type]["cos"], position_embeddings[layer_type]["sin"]),
+                attention_mask=causal_mask_mapping[layer_type],
+                position_ids=position_ids,
                 past_key_values=self.past_key_values
             )
 
         return hidden_states
 
-    def generate(self, input_ids, attention_mask, max_new_tokens=10):
+
+    def generate_embeddigs(self, input_ids, starting_position_id=0):
+        """Generates token and positional embeddings."""
+        ## Token Embeddings
+        input_embeddings = self.model.model.embed_tokens.forward(input_ids=input_ids)
+
+        ## Position Embeddings
+        position_ids = torch.arange(
+            start=starting_position_id,
+            end=starting_position_id + input_embeddings.shape[1],
+            device=input_embeddings.device
+        ).unsqueeze(0)
+
+        position_embeddings = {}
+
+        for layer_type in set(self.model.config.layer_types):
+            cos, sin = self.model.model.rotary_emb(
+                input_embeddings,
+                position_ids,
+                layer_type
+            )
+
+            position_embeddings[layer_type] = {
+                "cos": cos,
+                "sin": sin
+            }
+
+        return input_embeddings, position_ids, position_embeddings
+
+    def generate(self, input_ids, attention_mask, output_logits="first_pass", max_new_tokens=10):
         generated_logits = []
         generated_ids = []
 
@@ -266,15 +323,24 @@ class RecirculatedGemma:
 
         return generated_logits, generated_ids
 
-    def create_attention_masks(self, token_embedding, attention_mask, token_position, past_key_values):
+
+
+    def create_attention_masks(
+            self,
+            token_embedding,
+            attention_mask,
+            token_position,
+            past_key_values,
+            position_ids
+        ):
         if token_position is not None:
             num_of_tokens = token_embedding.shape[1]
             end = num_of_tokens + token_position
 
             attention_mask = attention_mask[:, :end]
-            position_ids = self.position_ids[:, token_position:end]
+            position_ids = position_ids[:, token_position:end]
         else:
-            position_ids = self.position_ids
+            position_ids = position_ids
         
         mask_kwargs = {
             "config": self.model.config,
@@ -287,10 +353,12 @@ class RecirculatedGemma:
         sliding_mask_kwargs = mask_kwargs.copy()
         
         # Create the masks
-        self.causal_mask_mapping = {
+        causal_mask_mapping = {
             "full_attention": create_causal_mask(**mask_kwargs, layer_idx=self.upper_full_layers),
             "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs, layer_idx=self.upper_sliding_layers),
         }
+
+        return causal_mask_mapping
 
     def run_vanilla(self, input_ids, attention_mask=None):
         with torch.no_grad():

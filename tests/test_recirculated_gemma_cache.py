@@ -134,19 +134,19 @@ def test_nonzero_alpha_selects_pass_outputs(tiny_gemma, monkeypatch, length):
     final_pass = tiny_gemma.recirculate_token
 
     # Capture both readouts from real passes, before run selects its outputs.
-    def capture_warmup(hidden_states):
-        result = warmup_pass(hidden_states)
+    def capture_warmup(**kwargs):
+        result = warmup_pass(**kwargs)
         first_pass_states.append(result.clone())
         return result
 
-    def capture_pair(hidden_states, token_position):
-        result = block_pass(hidden_states, token_position)
+    def capture_pair(**kwargs):
+        result = block_pass(**kwargs)
         recirculated_states.append(result[:, :1, :].clone())
         first_pass_states.append(result[:, 1:2, :].clone())
         return result
 
-    def capture_final(token_position):
-        result = final_pass(token_position)
+    def capture_final(**kwargs):
+        result = final_pass(**kwargs)
         recirculated_states.append(result.clone())
         return result
 
