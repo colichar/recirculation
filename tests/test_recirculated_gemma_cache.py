@@ -74,30 +74,29 @@ def tiny_gemma(monkeypatch, request):
                 assert tensor.dtype == dtype
 
 
-def test_run_requires_attention_mask(tiny_gemma):
+def test_recirculated_run_requires_attention_mask(tiny_gemma):
     input_ids = torch.tensor([[2, 3]])
     with pytest.raises(TypeError, match="attention_mask"):
-        tiny_gemma.run(input_ids)
+        tiny_gemma.recirculated_run(input_ids)
 
 
-def test_run_rejects_none_mask_before_computation(tiny_gemma, monkeypatch):
+def test_recirculated_run_rejects_none_mask_before_computation(tiny_gemma, monkeypatch):
     def unexpected_embedding(*args, **kwargs):
         pytest.fail("Missing masks must be rejected before model computation")
 
     monkeypatch.setattr(tiny_gemma.model.model.embed_tokens, "forward", unexpected_embedding)
     with pytest.raises(ValueError, match="attention_mask must not be None"):
-        tiny_gemma.run(torch.tensor([[2, 3]]), attention_mask=None)
+        tiny_gemma.recirculated_run(torch.tensor([[2, 3]]), attention_mask=None)
 
 
 @execution_cases
 @pytest.mark.parametrize("length", [1, 7, 13])
-@pytest.mark.parametrize("output_logits", ["first_pass", "recirculated_pass"])
-def test_zero_alpha_matches_vanilla_across_sliding_window(tiny_gemma, length, output_logits):
+def test_zero_alpha_matches_vanilla_across_sliding_window(tiny_gemma, length):
     tiny_gemma.alpha = 0.0
     input_ids = torch.arange(2, 2 + length, device=tiny_gemma.model.device).unsqueeze(0)
     attention_mask = torch.ones_like(input_ids)
     expected, _ = tiny_gemma.run_vanilla(input_ids, attention_mask)
-    actual, _ = tiny_gemma.run(input_ids, attention_mask, output_logits=output_logits)
+    actual, _ = tiny_gemma.recirculated_run(input_ids, attention_mask)
     # BF16 allows approximately one rounding unit across different execution
     # schedules. Evidence and the tighter invariant tolerances are in
     # docs/numerical-validation.md.
@@ -108,32 +107,28 @@ def test_zero_alpha_matches_vanilla_across_sliding_window(tiny_gemma, length, ou
 
 
 @execution_cases
-@pytest.mark.parametrize("output_logits", ["first_pass", "recirculated_pass"])
-def test_future_tokens_do_not_change_earlier_logits(tiny_gemma, output_logits):
+def test_future_tokens_do_not_change_earlier_logits(tiny_gemma):
     tiny_gemma.alpha = 0.25
     input_ids = torch.arange(2, 15, device=tiny_gemma.model.device).unsqueeze(0)
     changed_ids = input_ids.clone()
     changed_ids[:, 11:] = torch.tensor([20, 21], device=input_ids.device)
     mask = torch.ones_like(input_ids)
-    original, _ = tiny_gemma.run(input_ids, mask, output_logits=output_logits)
-    changed, _ = tiny_gemma.run(changed_ids, mask, output_logits=output_logits)
-    # Valid for either first-pass or recirculated readout: no future-token leakage.
+    original, _ = tiny_gemma.recirculated_run(input_ids, mask)
+    changed, _ = tiny_gemma.recirculated_run(changed_ids, mask)
     assert_logits_close(original[:, :11], changed[:, :11])
 
 
 @execution_cases
 @pytest.mark.parametrize("length", [1, 7])
-def test_nonzero_alpha_selects_pass_outputs(tiny_gemma, monkeypatch, length):
+def test_recirculated_run_returns_first_pass_readout(tiny_gemma, monkeypatch, length):
     tiny_gemma.alpha = 0.25
     input_ids = torch.arange(2, 2 + length, device=tiny_gemma.model.device).unsqueeze(0)
     mask = torch.ones_like(input_ids)
     first_pass_states = []
-    recirculated_states = []
     warmup_pass = tiny_gemma.warmup_pass
     block_pass = tiny_gemma.recirculated_block_pass
-    final_pass = tiny_gemma.recirculate_token
 
-    # Capture both readouts from real passes, before run selects its outputs.
+    # Capture first-pass outputs from the real warmup and paired passes.
     def capture_warmup(**kwargs):
         result = warmup_pass(**kwargs)
         first_pass_states.append(result.clone())
@@ -141,34 +136,18 @@ def test_nonzero_alpha_selects_pass_outputs(tiny_gemma, monkeypatch, length):
 
     def capture_pair(**kwargs):
         result = block_pass(**kwargs)
-        recirculated_states.append(result[:, :1, :].clone())
         first_pass_states.append(result[:, 1:2, :].clone())
-        return result
-
-    def capture_final(**kwargs):
-        result = final_pass(**kwargs)
-        recirculated_states.append(result.clone())
         return result
 
     with monkeypatch.context() as hooks:
         hooks.setattr(tiny_gemma, "warmup_pass", capture_warmup)
         hooks.setattr(tiny_gemma, "recirculated_block_pass", capture_pair)
-        hooks.setattr(tiny_gemma, "recirculate_token", capture_final)
-        recirculated, _ = tiny_gemma.run(input_ids, mask, output_logits="recirculated_pass")
+        actual, _ = tiny_gemma.recirculated_run(input_ids, mask)
 
     with torch.no_grad():
         expected_first = tiny_gemma.model.lm_head(
             tiny_gemma.model.model.norm(torch.cat(first_pass_states, dim=1))
         )
-        expected_recirculated = tiny_gemma.model.lm_head(
-            tiny_gemma.model.model.norm(torch.cat(recirculated_states, dim=1))
-        )
-
-    first, _ = tiny_gemma.run(input_ids, mask, output_logits="first_pass")
-    default, _ = tiny_gemma.run(input_ids, mask)
-    assert first.shape == recirculated.shape == (1, length, tiny_gemma.model.config.vocab_size)
-    # Compare all positions, including the warmup and final-token boundaries.
-    assert_logits_close(first, expected_first)
-    assert_logits_close(recirculated, expected_recirculated)
-    assert_logits_close(default, first)
-    assert not torch.allclose(expected_first, expected_recirculated, rtol=1e-5, atol=1e-6)
+    assert actual.shape == (1, length, tiny_gemma.model.config.vocab_size)
+    # Compare all positions, including the warmup and paired-pass boundaries.
+    assert_logits_close(actual, expected_first)
