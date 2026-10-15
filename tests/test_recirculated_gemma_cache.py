@@ -61,7 +61,8 @@ def tiny_gemma(monkeypatch, request):
         return model.to(device=device, dtype=kwargs["torch_dtype"])
 
     monkeypatch.setattr(module.AutoModelForCausalLM, "from_pretrained", load_model)
-    wrapper = module.RecirculatedGemma(source=2, destination=0, dtype=dtype)
+    # Both lower and upper stacks include sliding and full attention layers.
+    wrapper = module.RecirculatedGemma(source=2, destination=1, dtype=dtype)
     for parameter in wrapper.model.parameters():
         assert parameter.device.type == device
         assert parameter.dtype == dtype
@@ -151,3 +152,211 @@ def test_recirculated_run_returns_first_pass_readout(tiny_gemma, monkeypatch, le
     assert actual.shape == (1, length, tiny_gemma.model.config.vocab_size)
     # Compare all positions, including the warmup and paired-pass boundaries.
     assert_logits_close(actual, expected_first)
+
+
+def greedy_generation_reference(input_ids, attention_mask, max_new_tokens, forward):
+    logits_per_step = []
+    generated_ids = []
+
+    for _ in range(max_new_tokens):
+        logits, _ = forward(input_ids, attention_mask)
+        next_logits = logits[:, -1, :]
+        next_token_id = next_logits.argmax(dim=-1, keepdim=True)
+        logits_per_step.append(next_logits)
+        generated_ids.append(next_token_id)
+
+        input_ids = torch.cat([input_ids, next_token_id], dim=1)
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones_like(next_token_id)], dim=1
+        )
+
+    return torch.stack(logits_per_step, dim=1), torch.cat(generated_ids, dim=1)
+
+
+def snapshot_generation_state(wrapper):
+    cache = wrapper.past_key_values
+    return {
+        "lengths": [cache.get_seq_length(i) for i in range(len(cache.layers))],
+        "positions": [cache.get_query_offset(i) for i in range(len(cache.layers))],
+        "kv": [(layer.keys.clone(), layer.values.clone()) for layer in cache.layers],
+        "destination": wrapper.destination_hidden.clone(),
+        "source": wrapper.source_hidden.clone(),
+    }
+
+
+def assert_generation_state_matches_reference(actual, expected, wrapper, processed_length):
+    assert actual["lengths"] == expected["lengths"] == [
+        processed_length if i <= wrapper.destination else processed_length - 1
+        for i in range(wrapper.model.config.num_hidden_layers)
+    ]
+    assert actual["positions"] == expected["positions"] == actual["lengths"]
+    rtol, atol = (1e-2, 1e-5) if wrapper.model.dtype == torch.bfloat16 else (1e-5, 1e-6)
+    for actual_kv, expected_kv in zip(actual["kv"], expected["kv"], strict=True):
+        for actual_tensor, expected_tensor in zip(actual_kv, expected_kv, strict=True):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual["destination"], expected["destination"], rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual["source"], expected["source"], rtol=rtol, atol=atol)
+
+
+@execution_cases
+@pytest.mark.parametrize("prompt_length", [1, 4])
+def test_recirculated_generate_matches_full_sequence_reference(
+    tiny_gemma, monkeypatch, prompt_length
+):
+    tiny_gemma.alpha = 0.25
+    input_ids = torch.arange(
+        2, 2 + prompt_length, device=tiny_gemma.model.device
+    ).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids)
+    max_new_tokens = 3
+
+    def unexpected_standalone_recirculation(*args, **kwargs):
+        pytest.fail("first-pass generation must not recirculate the final token alone")
+
+    monkeypatch.setattr(
+        tiny_gemma, "recirculate_token", unexpected_standalone_recirculation
+    )
+    actual_logits, actual_ids = tiny_gemma.recirculated_generate(
+        input_ids, attention_mask, max_new_tokens=max_new_tokens
+    )
+    actual_state = snapshot_generation_state(tiny_gemma)
+
+    expected_logits, expected_ids = greedy_generation_reference(
+        input_ids.clone(),
+        attention_mask.clone(),
+        max_new_tokens,
+        tiny_gemma.recirculated_run,
+    )
+    assert_logits_close(actual_logits, expected_logits)
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+
+    # The last sampled ID has not been processed. The preceding generated token
+    # has first-pass source/destination states, but uncommitted upper-layer KV.
+    processed_ids = torch.cat([input_ids, actual_ids[:, :-1]], dim=1)
+    tiny_gemma.recirculated_run(processed_ids, torch.ones_like(processed_ids))
+    expected_state = snapshot_generation_state(tiny_gemma)
+    assert_generation_state_matches_reference(
+        actual_state, expected_state, tiny_gemma, processed_ids.shape[1]
+    )
+
+
+@execution_cases
+@pytest.mark.parametrize("max_new_tokens", [1, 2])
+def test_generation_prefill_and_first_decoding_transition(
+    tiny_gemma, monkeypatch, max_new_tokens
+):
+    input_ids = torch.tensor([[2, 3, 4, 5]], device=tiny_gemma.model.device)
+    attention_mask = torch.ones_like(input_ids)
+    lower_positions = {layer: [] for layer in range(tiny_gemma.destination + 1)}
+    cache_initializations = []
+    module = importlib.import_module("recirculated_gemma")
+    cache_class = module.RecirculationDynamicCache
+
+    def capture_lower_forward(layer_idx, forward):
+        def capture(**kwargs):
+            lower_positions[layer_idx].append(kwargs["position_ids"].clone())
+            return forward(**kwargs)
+
+        return capture
+
+    def create_cache(**kwargs):
+        cache_initializations.append(1)
+        return cache_class(**kwargs)
+
+    with monkeypatch.context() as hooks:
+        for layer_idx in lower_positions:
+            layer = tiny_gemma.model.model.layers[layer_idx]
+            hooks.setattr(layer, "forward", capture_lower_forward(layer_idx, layer.forward))
+        hooks.setattr(module, "RecirculationDynamicCache", create_cache)
+        _, generated_ids = tiny_gemma.recirculated_generate(
+            input_ids, attention_mask, max_new_tokens=max_new_tokens
+        )
+    actual_state = snapshot_generation_state(tiny_gemma)
+
+    assert len(cache_initializations) == 1
+    for positions in lower_positions.values():
+        assert len(positions) == max_new_tokens
+        torch.testing.assert_close(
+            positions[0], torch.arange(input_ids.shape[1], device=input_ids.device)[None, :]
+        )
+        if max_new_tokens == 2:
+            torch.testing.assert_close(
+                positions[1], torch.tensor([[input_ids.shape[1]]], device=input_ids.device)
+            )
+
+    processed_ids = torch.cat([input_ids, generated_ids[:, :-1]], dim=1)
+    tiny_gemma.recirculated_run(processed_ids, torch.ones_like(processed_ids))
+    expected_state = snapshot_generation_state(tiny_gemma)
+    assert_generation_state_matches_reference(
+        actual_state, expected_state, tiny_gemma, processed_ids.shape[1]
+    )
+
+
+@execution_cases
+def test_nonzero_alpha_changes_run_and_generation_logits(tiny_gemma):
+    input_ids = torch.arange(2, 9, device=tiny_gemma.model.device).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids)
+
+    tiny_gemma.alpha = 0.0
+    zero_alpha_run, _ = tiny_gemma.recirculated_run(input_ids, attention_mask)
+    zero_alpha_generate, _ = tiny_gemma.recirculated_generate(
+        input_ids, attention_mask, max_new_tokens=3
+    )
+
+    tiny_gemma.alpha = 0.25
+    nonzero_alpha_run, _ = tiny_gemma.recirculated_run(input_ids, attention_mask)
+    nonzero_alpha_generate, _ = tiny_gemma.recirculated_generate(
+        input_ids, attention_mask, max_new_tokens=3
+    )
+
+    assert not torch.allclose(zero_alpha_run, nonzero_alpha_run, rtol=1e-5, atol=1e-6)
+    assert not torch.allclose(
+        zero_alpha_generate, nonzero_alpha_generate, rtol=1e-5, atol=1e-6
+    )
+
+
+@execution_cases
+@pytest.mark.parametrize("prompt_length", [1, 4])
+def test_zero_alpha_generate_matches_vanilla_reference(tiny_gemma, prompt_length):
+    tiny_gemma.alpha = 0.0
+    input_ids = torch.arange(
+        2, 2 + prompt_length, device=tiny_gemma.model.device
+    ).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids)
+    max_new_tokens = 3
+
+    actual_logits, actual_ids = tiny_gemma.recirculated_generate(
+        input_ids, attention_mask, max_new_tokens=max_new_tokens
+    )
+    expected_logits, expected_ids = greedy_generation_reference(
+        input_ids.clone(),
+        attention_mask.clone(),
+        max_new_tokens,
+        tiny_gemma.run_vanilla,
+    )
+
+    if tiny_gemma.model.dtype == torch.bfloat16:
+        assert_logits_close(actual_logits, expected_logits, rtol=1e-2, atol=1e-5)
+    else:
+        assert_logits_close(actual_logits, expected_logits)
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+
+
+@execution_cases
+def test_recirculated_generate_resets_state_between_requests(tiny_gemma):
+    first_prompt = torch.tensor([[2, 3, 4, 5]], device=tiny_gemma.model.device)
+    other_prompt = torch.tensor([[6, 7, 8, 9, 10]], device=tiny_gemma.model.device)
+    tiny_gemma.alpha = 0.25
+
+    first_logits, first_ids = tiny_gemma.recirculated_generate(
+        first_prompt, torch.ones_like(first_prompt), max_new_tokens=3
+    )
+    tiny_gemma.recirculated_generate(
+        other_prompt, torch.ones_like(other_prompt), max_new_tokens=2
+    )
+    second_logits, second_ids = tiny_gemma.recirculated_generate(
+        first_prompt, torch.ones_like(first_prompt), max_new_tokens=3
+    )
+
+    assert_logits_close(first_logits, second_logits)
+    torch.testing.assert_close(first_ids, second_ids, rtol=0, atol=0)

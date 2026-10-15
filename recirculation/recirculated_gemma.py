@@ -24,6 +24,17 @@ class RecirculatedGemma:
 
         self.final_hidden_states = []
 
+        lower_layers = range(self.destination + 1)
+
+        self.lower_full_layers = next(
+            i for i in lower_layers
+            if self.model.config.layer_types[i] == "full_attention"
+        )
+        self.lower_sliding_layers = next(
+            i for i in lower_layers
+            if self.model.config.layer_types[i] == "sliding_attention"
+        )
+
         upper_layers = range(
             self.destination + 1,
             self.model.config.num_hidden_layers
@@ -276,14 +287,37 @@ class RecirculatedGemma:
 
         return position_ids, position_embeddings
 
-    def generate(self, input_ids, attention_mask, output_logits="first_pass", max_new_tokens=10):
+    def recirculated_generate(
+            self,
+            input_ids,
+            attention_mask,
+            max_new_tokens=10,
+            K=1
+        ):
         generated_logits = []
         generated_ids = []
 
+        with torch.no_grad():
+            ## Prefill and first token prediction
 
-        for _ in range(max_new_tokens):
-            logits, _ = self.run(input_ids=input_ids, attention_mask=attention_mask)
+            ## Empty Cache
+            self.past_key_values = RecirculationDynamicCache(config=self.model.config)
 
+            ## Generate Embeddings
+            input_embeddings = self.generate_input_embeddigs(input_ids=input_ids)
+            position_ids, position_embeddings = self.generate_position_embeddings(hidden_states=input_embeddings)
+
+            ## Prefill & First-Next-Token Generation
+            logits, _ = self.recirculated_run(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                input_embeddings=input_embeddings,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                reset_cache=False,
+                K=K
+            )
+        
             next_logits = logits[:, -1, :]
             next_token_id = next_logits.argmax(dim=-1, keepdim=True)
 
@@ -301,10 +335,89 @@ class RecirculatedGemma:
             generated_logits.append(next_logits)
             generated_ids.append(next_token_id)
 
-        generated_logits = torch.stack(generated_logits, dim=1)
-        generated_ids = torch.cat(generated_ids, dim=1)
+            ## Iterative next token prediction
+            for _ in range(max_new_tokens-1):
+                # Write an iterative method for autoregressive_prediction `autoregressive_run`
+                input_sequence_len = input_ids.shape[1]
 
-        return generated_logits, generated_ids
+                # Generate embeddings
+                hidden_states = self.generate_input_embeddigs(next_token_id)
+                position_ids, position_embeddings = self.generate_position_embeddings(hidden_states=hidden_states, start=input_sequence_len-K-1, end=input_sequence_len+K-1)
+
+                # Lower layer pass for new token
+                self.past_key_values.commit_tokens = None
+
+                causal_mask_mapping = self.create_attention_masks(
+                    input_embeddings=hidden_states,
+                    attention_mask=attention_mask,
+                    token_position=None,
+                    past_key_values=self.past_key_values,
+                    position_ids=position_ids[:,-K:],
+                    mask_layer_indices={
+                        "full_attention": self.lower_full_layers,
+                        "sliding_attention": self.lower_sliding_layers
+                    }
+                )
+
+                for layer in range(self.destination + 1):
+                    layer_type = self.model.config.layer_types[layer]
+
+                    sliced_position_embeddings = self._slice_position_embeddings(position_embeddings, start=K, end=2*K)
+                        
+                    hidden_states = self.model.model.layers[layer].forward(
+                        hidden_states=hidden_states,
+                        position_embeddings=(sliced_position_embeddings[layer_type]["cos"], sliced_position_embeddings[layer_type]["sin"]),
+                        attention_mask=causal_mask_mapping[layer_type],
+                        position_ids=position_ids[:,-K:],
+                        past_key_values=self.past_key_values
+                    )
+
+                # Recirculate K tokens
+                self.past_key_values.commit_tokens = K
+
+                causal_mask_mapping = self.create_attention_masks(
+                    input_embeddings=torch.cat([hidden_states, hidden_states], dim=1),  # dummy input_embeddings for mask creation
+                    attention_mask=attention_mask,
+                    token_position=None,
+                    past_key_values=self.past_key_values,
+                    position_ids=position_ids
+                )
+
+                hidden_states = self.recirculated_block_pass(
+                    hidden_states=hidden_states,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    causal_mask_mapping=causal_mask_mapping,
+                    K=K
+                )
+
+                # Accumulate final hidden states
+                final_hidden_state = hidden_states[:, K:2*K, :]
+                self.final_hidden_states.append(final_hidden_state)
+
+                final_hidden_state = self.model.model.norm(final_hidden_state)
+                next_logits = self.model.lm_head(final_hidden_state)
+                next_logits = next_logits[:, -1, :]
+                next_token_id = next_logits.argmax(dim=-1, keepdim=True)
+    
+                input_ids = torch.cat([input_ids, next_token_id], dim=1)
+                attention_mask = torch.cat([
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device
+                    )
+                ], dim=1)
+
+                generated_logits.append(next_logits)
+                generated_ids.append(next_token_id)
+
+                
+            generated_logits = torch.stack(generated_logits, dim=1)
+            generated_ids = torch.cat(generated_ids, dim=1)
+
+            return generated_logits, generated_ids
 
 
 
@@ -314,7 +427,8 @@ class RecirculatedGemma:
             attention_mask,
             token_position,
             past_key_values,
-            position_ids
+            position_ids,
+            mask_layer_indices=None
         ):
         if token_position is not None:
             num_of_tokens = input_embeddings.shape[1]
@@ -322,8 +436,12 @@ class RecirculatedGemma:
 
             attention_mask = attention_mask[:, :end]
             position_ids = position_ids[:, token_position:end]
-        else:
-            position_ids = position_ids
+
+        if mask_layer_indices is None:
+            mask_layer_indices = {
+                "full_attention": self.upper_full_layers,
+                "sliding_attention": self.upper_sliding_layers
+            }
         
         mask_kwargs = {
             "config": self.model.config,
@@ -336,9 +454,10 @@ class RecirculatedGemma:
         sliding_mask_kwargs = mask_kwargs.copy()
         
         # Create the masks
+        # The lower-stack mask mapping assumes destination > 0; destination=0 is not supported yet.
         causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs, layer_idx=self.upper_full_layers),
-            "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs, layer_idx=self.upper_sliding_layers),
+            "full_attention": create_causal_mask(**mask_kwargs, layer_idx=mask_layer_indices["full_attention"]),
+            "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs, layer_idx=mask_layer_indices["sliding_attention"]),
         }
 
         return causal_mask_mapping
