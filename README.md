@@ -4,9 +4,9 @@ This project implements DeepMind's **Recirculation** method for Transformer lang
 
 ## Forward pass
 
-[`RecirculatedGemma.run`](recirculation/recirculated_gemma.py) processes a complete input sequence with a fresh cache and returns logits at every token position. The last position's logits predict the next token. The diagrams below describe the current **K = 1 paired execution schedule**.
+[`RecirculatedGemma.recirculated_run`](recirculation/recirculated_gemma.py) processes a complete input sequence with a fresh cache by default and returns logits at every token position. The last position's logits predict the next token. The diagrams below describe the **K = 1 paired execution schedule**.
 
-Layer indices are zero-based: **lower layers** are from `0` to `destination`, and **upper layers** are from `destination + 1` to `ast`. Recirculation reuses the lower-layer outputs and reruns only the upper layers.
+Layer indices are zero-based: **lower layers** are from `0` to `destination`, and **upper layers** are from `destination + 1` to the last layer. Recirculation reuses the lower-layer outputs and reruns only the upper layers.
 
 ### Execution schedule and output selection
 
@@ -15,14 +15,14 @@ Layer indices are zero-based: **lower layers** are from `0` to `destination`, an
 1. **Lower-layer prefill:** process all input tokens together through the lower layers with causal attention. Keep their destination-layer hidden states for the upper passes.
 2. **First-token warmup:** process token 0 through the upper layers once. Save its first-pass source and destination hidden states for recirculation.
 3. **Paired passes:** recirculate token `i` alongside the first upper-layer pass of token `i + 1`, in one two-token call. Save the new token's first-pass source and destination states for the following pair.
-4. **Optional final recirculation:** rerun the final token's upper layers only when requesting recirculated-pass output.
+4. **Optional final recirculation (recurrent variant):** rerun the final token's upper layers to read out its recirculated state. The paper-faithful readout does not need this pass.
 
 `F` and `R` in the diagram are final upper-layer hidden states, before the model's final normalization and language-model head:
 
-- **`output_logits="first_pass"` (default, paper-faithful readout):** select the initial warmup output and each pair's new-token output. No separate final-token pass is needed.
-- **`output_logits="recirculated_pass"` (ablation):** select each pair's recirculated-token output and the separate final-token recirculation output.
+- **`recirculated_pass` (default, paper-faithful readout, implemented by `recirculated_run` and `recirculated_generate`):** select the initial warmup output and each pair's new-token first-pass output. No separate final-token pass is needed.
+- **`recurrent_pass` (experimental variant):** select each pair's recirculated-token output and the separate final-token recirculation output.
 
-The selected states are concatenated in token order, then passed through final normalization and the LM head. For a single-token input, the paired loop is empty: the output comes from either warmup or the optional recirculation. A first-pass output can already incorporate **earlier tokens' recirculated context**; “first pass” refers to the current token's own processing.
+The selected states are concatenated in token order, then passed through final normalization and the LM head. For a single-token input, the paired loop is empty: `recirculated_pass` reads out the warmup state, while the proposed `recurrent_pass` would read out the optional recirculation. A first-pass output can already incorporate **earlier tokens' recirculated context**.
 
 ### Inside a paired pass
 
@@ -47,11 +47,11 @@ At each upper layer, attention uses retained past KV together with both tokens' 
 | Lower-layer prefill | `None` | All input tokens, in lower layers |
 | Initial upper-layer warmup | `0` | None |
 | Paired upper-layer pass | `1` | Previous token's recirculated KV only |
-| Optional final upper-layer recirculation | `0` | None; readout only |
+| Optional final upper-layer recirculation (`recurrent_pass` variant) | `0` | None; readout only |
 
 Full-attention layers retain all committed KV. Sliding-window layers retain at most `sliding_window - 1` committed positions in the normal execution path; current attention still receives the KV needed before that eviction.
 
-After a sequence of length `N`, the lower layers have committed `N` positions and the upper layers `N - 1`, subject to sliding-window eviction. **The final token's upper-layer KV remains uncommitted in both output modes**, even when its recirculated logits are computed. Each subsequent `run` call rebuilds the cache; persistent-cache autoregressive generation is tracked separately in [issue #5](https://github.com/colichar/recirculation/issues/5).
+After a sequence of length `N`, the lower layers have committed `N` positions and the upper layers `N - 1`, subject to sliding-window eviction. **The final token's upper-layer KV remains uncommitted.** Each `recirculated_run` call rebuilds the cache by default. For K = 1 autoregressive decoding, `recirculated_generate` reuses the cache across generated tokens within one request, selects next tokens from `recirculated_pass` logits, and resets the state between requests.
 
 ## Environment setup
 

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1040" height="860" viewBox="0 0 1040 860" role="img" aria-labelledby="title desc">
   <title id="title">Recirculation forward-pass schedule</title>
-  <desc id="desc">A four-token example of the current K equals 1 schedule. All tokens first traverse the lower layers. The upper layers warm up token zero, then process three pairs: recirculated token i and first-pass token i plus one. Only recirculated output mode needs a separate final-token pass. First-pass mode selects F zero through F three; recirculated mode selects R zero through R three.</desc>
+  <desc id="desc">A four-token example of the K equals 1 schedule. All tokens first traverse the lower layers. The upper layers warm up token zero, then process three pairs: recirculated token i and first-pass token i plus one. Only the proposed recurrent-pass variant needs a separate final-token pass. Paper-faithful recirculated_pass selects F zero through F three; recurrent_pass selects R zero through R three.</desc>
   <defs>
     <style>
       text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; }
@@ -19,7 +19,7 @@
   </defs>
   <rect width="1040" height="860" rx="16" fill="#ffffff"/>
   <text x="40" y="46" class="title">Forward pass · four input tokens</text>
-  <text x="40" y="76" class="small">Current run schedule · K = 1 · execution proceeds from top to bottom</text>
+  <text x="40" y="76" class="small">Paired execution schedule · K = 1 · execution proceeds from top to bottom</text>
 
   <rect x="40" y="97" width="24" height="24" rx="5" class="first"/>
   <text x="76" y="115" class="small">F = first upper-layer pass</text>
@@ -79,16 +79,16 @@
   <text x="840" y="535" text-anchor="middle" class="token first-text">F₃</text>
 
   <text x="52" y="601" class="label">Optional final pass</text>
-  <text x="52" y="626" class="small">Recirculated readout only without KV commit</text>
+  <text x="52" y="626" class="small">Recurrent variant only · no KV commit</text>
   <rect x="780" y="572" width="120" height="48" rx="9" class="recirc" stroke-dasharray="6 4"/>
   <text x="840" y="603" text-anchor="middle" class="token recirc-text">R₃</text>
 
   <text x="40" y="666" class="label">Select upper-layer outputs in token order</text>
   <rect x="40" y="682" width="465" height="82" rx="10" class="first"/>
-  <text x="60" y="711" class="label first-text">first_pass · default / paper-faithful</text>
+  <text x="60" y="711" class="label first-text">recirculated_pass · default</text>
   <text x="60" y="742" class="token first-text">F₀ → F₁ → F₂ → F₃</text>
   <rect x="525" y="682" width="475" height="82" rx="10" class="recirc"/>
-  <text x="545" y="711" class="label recirc-text">recirculated_pass · ablation</text>
+  <text x="545" y="711" class="label recirc-text">recurrent_pass · proposed variant</text>
   <text x="545" y="742" class="token recirc-text">R₀ → R₁ → R₂ → R₃</text>
 
   <rect x="40" y="786" width="960" height="46" rx="10" fill="#f0f4f8"/>
