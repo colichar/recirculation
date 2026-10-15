@@ -67,7 +67,7 @@
   <rect x="560" y="656" width="440" height="136" rx="10" class="first"/>
   <text x="580" y="688" class="label first-text">Save pending first-pass states</text>
   <text x="580" y="718" class="body">Keep h_d,i+1 and h_s,i+1 for the next pair.</text>
-  <text x="580" y="746" class="small">Fᵢ₊₁ supplies the first-pass-mode readout.</text>
+  <text x="580" y="746" class="small">Fᵢ₊₁ supplies the recirculated_pass readout.</text>
   <text x="580" y="774" class="small">This token's upper-layer KV is not retained.</text>
 
   <rect x="40" y="818" width="960" height="46" rx="10" fill="#f0f4f8"/>
