@@ -9,6 +9,8 @@ class RecirculatedGemma:
         self.source = source
         self.destination = destination
         self.alpha = alpha
+        # Paper used beta = 1 for all experiments
+        self.beta = 1
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained( 
@@ -202,7 +204,7 @@ class RecirculatedGemma:
         """Recirculated pass for block size K and normal pass for the subsequent block size K.""" 
         source_scaled = self.source_hidden  * (self.destination_hidden.norm(dim=-1, keepdim=True) / self.source_hidden.norm(dim=-1, keepdim=True))
 
-        recirculated_token = self.alpha * source_scaled + (1 - self.alpha) * self.destination_hidden
+        recirculated_token = self.alpha * source_scaled + self.beta * self.destination_hidden
 
         hidden_states = torch.cat([recirculated_token, hidden_states], dim=1)
 
@@ -234,7 +236,7 @@ class RecirculatedGemma:
         """Recirculates hidden state from source layer to destinaton layer for first token in iteration."""
         source_scaled = self.source_hidden  * (self.destination_hidden.norm(dim=-1, keepdim=True) / self.source_hidden.norm(dim=-1, keepdim=True))
 
-        hidden_states = self.alpha * source_scaled + (1 - self.alpha) * self.destination_hidden
+        hidden_states = self.alpha * source_scaled + self.beta * self.destination_hidden
 
         for layer in range(self.destination + 1, self.model.config.num_hidden_layers):
             layer_type = self.model.config.layer_types[layer]
