@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.13"
 # Preserve the core versions from the previous working environment.
 dependencies = [
     "accelerate==1.15.0",
+    "datasets>=5.1.0",
     "transformers==5.17.0",
 ]
 
