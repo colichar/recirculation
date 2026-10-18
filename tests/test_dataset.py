@@ -36,7 +36,7 @@ def test_windows_keep_text_order_and_reset_at_document_boundaries(monkeypatch):
         dataset_module, "load_dataset", lambda *args, **kwargs: Documents([document(first), document(second)])
     )
 
-    windows = list(dataset_module.preprocess_dataset(Tokenizer()))
+    windows = list(dataset_module.dataloader(Tokenizer()))
 
     assert len(windows) == 3
     for (ids, mask), expected_text in zip(
@@ -53,10 +53,10 @@ def test_final_fragment_31_is_discarded_and_32_is_padded(monkeypatch):
     documents = [document(text[:1023 + 31]), document(text)]
     monkeypatch.setattr(dataset_module, "load_dataset", lambda *args, **kwargs: Documents(documents))
 
-    first_only = list(dataset_module.preprocess_dataset(Tokenizer(), document_limit=1))
+    first_only = list(dataset_module.dataloader(Tokenizer(), document_limit=1))
     assert len(first_only) == 1
 
-    windows = list(dataset_module.preprocess_dataset(Tokenizer()))
+    windows = list(dataset_module.dataloader(Tokenizer()))
     assert len(windows) == 3
     ids, mask = windows[-1]
     assert ids.shape == mask.shape == (1024,)
@@ -76,8 +76,8 @@ def test_document_limit_and_pinned_streaming_split(monkeypatch):
 
     monkeypatch.setattr(dataset_module, "load_dataset", load_dataset)
 
-    limited = list(dataset_module.preprocess_dataset(Tokenizer(), document_limit=1))
-    full = list(dataset_module.preprocess_dataset(Tokenizer(), document_limit=None))
+    limited = list(dataset_module.dataloader(Tokenizer(), document_limit=1))
+    full = list(dataset_module.dataloader(Tokenizer(), document_limit=None))
 
     assert len(limited) == 1
     assert limited[0][0][1].item() == 10

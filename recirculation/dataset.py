@@ -1,7 +1,7 @@
 from datasets import load_dataset
 import torch.nn.functional as F
 
-def preprocess_dataset(tokenizer, split="test", window_size=1023, document_limit=None):
+def dataloader(tokenizer, split="test", window_size=1023, document_limit=None):
     """Yield independent, BOS-prefixed windows from the PG19 dataset.
 
     Each window contains up to `window_size` text tokens plus one BOS token.
