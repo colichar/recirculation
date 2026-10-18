@@ -1,4 +1,5 @@
 import math
+from tqdm.auto import tqdm
 import torch.nn.functional as F
 from recirculation.dataset import dataloader
 
@@ -70,7 +71,12 @@ def evaluate_perplexity(model, document_limit=None):
     total_tokens = {mode: 0 for mode in MODES}
     total_windows = 0
     
-    for window_ids, window_mask in dataloader(tokenizer=model.tokenizer, document_limit=document_limit):
+    for window_ids, window_mask in tqdm(
+        dataloader(tokenizer=model.tokenizer, document_limit=document_limit),
+        desc="PG-19 · vanilla + recirc",
+        unit="window",
+        dynamic_ncols=True,
+        ):
         for mode in MODES:
             nll_sum, num_tokens = score_window_nll(
                 model=model,
@@ -93,7 +99,7 @@ def evaluate_perplexity(model, document_limit=None):
 if __name__ == "__main__":
     import torch
     from recirculation.recirculated_gemma import RecirculatedGemma
-    
+
     model = RecirculatedGemma(
         source=10,
         destination=4,
