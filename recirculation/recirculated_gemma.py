@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.masking_utils import (create_causal_mask, create_sliding_window_causal_mask)
-from recirculated_cache import RecirculationDynamicCache
+from recirculation.recirculated_cache import RecirculationDynamicCache
 
 
 class RecirculatedGemma:
