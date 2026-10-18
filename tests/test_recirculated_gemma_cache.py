@@ -29,9 +29,8 @@ def assert_logits_close(actual, expected, *, rtol=1e-5, atol=1e-6):
 def tiny_gemma(monkeypatch, request):
     params = getattr(request, "param", ("cpu", torch.float32))
     device, dtype = params[:2]
-    layer_types = (
-        params[2] if len(params) == 3 else ["sliding_attention", "full_attention"] * 2
-    )
+    layer_types = params[2] if len(params) >= 3 else ["sliding_attention", "full_attention"] * 2
+    alpha_ramp = params[3] if len(params) >= 4 else False
     if device == "cuda":
         if not torch.cuda.is_available():
             pytest.skip("CUDA is unavailable")
@@ -66,7 +65,9 @@ def tiny_gemma(monkeypatch, request):
 
     monkeypatch.setattr(module.AutoModelForCausalLM, "from_pretrained", load_model)
     # By default both stacks include sliding and full attention layers.
-    wrapper = module.RecirculatedGemma(source=2, destination=1, dtype=dtype)
+    wrapper = module.RecirculatedGemma(
+        source=2, destination=1, dtype=dtype, alpha_ramp=alpha_ramp
+    )
     for parameter in wrapper.model.parameters():
         assert parameter.device.type == device
         assert parameter.dtype == dtype
@@ -140,6 +141,71 @@ def test_sliding_only_lower_stack_matches_vanilla_across_window(tiny_gemma):
     state = snapshot_generation_state(tiny_gemma)
     assert state["lengths"] == [13, 13, 12, 12]
     assert state["positions"] == state["lengths"]
+
+
+@pytest.mark.parametrize(
+    "tiny_gemma",
+    [
+        (
+            "cpu", torch.float32,
+            ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
+            True,
+        )
+    ],
+    indirect=True,
+    ids=["sliding-only-lower-ramp"],
+)
+def test_alpha_ramp_resets_for_each_window_and_preserves_constant_mode(tiny_gemma, monkeypatch):
+    tiny_gemma.alpha = 0.07
+    alphas = []
+    block_pass = tiny_gemma.recirculated_block_pass
+
+    def capture_alpha(**kwargs):
+        alphas.append(kwargs["alpha"])
+        return block_pass(**kwargs)
+
+    monkeypatch.setattr(tiny_gemma, "recirculated_block_pass", capture_alpha)
+    ids = torch.arange(2, 15).unsqueeze(0)
+    ramped_logits, _ = tiny_gemma.recirculated_run(ids, torch.ones_like(ids))
+    assert len(alphas) == 12
+    assert [alphas[i] for i in (0, 1, 9, 10, 11)] == pytest.approx(
+        [0.0, 0.007, 0.063, 0.07, 0.07]
+    )
+
+    alphas.clear()
+    next_window = torch.tensor([[7, 8, 9]])
+    tiny_gemma.recirculated_run(next_window, torch.ones_like(next_window))
+    assert alphas == pytest.approx([0.0, 0.007])
+
+    alphas.clear()
+    tiny_gemma.alpha_ramp = False
+    constant_logits, _ = tiny_gemma.recirculated_run(ids, torch.ones_like(ids))
+    assert alphas == pytest.approx([0.07] * 12)
+    assert not torch.allclose(ramped_logits, constant_logits, rtol=1e-5, atol=1e-6)
+
+    tiny_gemma.alpha_ramp = True
+    tiny_gemma.alpha = 0.0
+    zero_logits, _ = tiny_gemma.recirculated_run(ids, torch.ones_like(ids))
+    vanilla_logits, _ = tiny_gemma.vanilla_run(ids, torch.ones_like(ids))
+    assert_logits_close(zero_logits, vanilla_logits)
+    assert not torch.allclose(ramped_logits, zero_logits, rtol=1e-5, atol=1e-6)
+
+
+def test_alpha_ramp_continues_from_prompt_during_generation(tiny_gemma, monkeypatch):
+    tiny_gemma.alpha = 0.07
+    tiny_gemma.alpha_ramp = True
+    alphas = []
+    block_pass = tiny_gemma.recirculated_block_pass
+
+    def capture_alpha(**kwargs):
+        alphas.append(kwargs["alpha"])
+        return block_pass(**kwargs)
+
+    monkeypatch.setattr(tiny_gemma, "recirculated_block_pass", capture_alpha)
+    ids = torch.tensor([[2, 3, 4, 5]])
+    tiny_gemma.recirculated_generate(ids, torch.ones_like(ids), max_new_tokens=2)
+    # Prompt recirculates positions 0..2; decoding next recirculates position 3.
+    assert alphas == pytest.approx([0.0, 0.007, 0.014, 0.021])
 
 
 @execution_cases

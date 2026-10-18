@@ -5,10 +5,19 @@ from recirculated_cache import RecirculationDynamicCache
 
 
 class RecirculatedGemma:
-    def __init__(self, source=11, destination=4, alpha=0.25, model_name="google/gemma-3-1b-it", dtype: torch.dtype = torch.float32):
+    def __init__(
+            self,
+            source=11,
+            destination=4,
+            alpha=0.25,
+            alpha_ramp=False,
+            model_name="google/gemma-3-1b-it",
+            dtype: torch.dtype = torch.float32
+            ):
         self.source = source
         self.destination = destination
         self.alpha = alpha
+        self.alpha_ramp = alpha_ramp
         # Paper used beta = 1 for all experiments
         self.beta = 1
 
@@ -41,6 +50,12 @@ class RecirculatedGemma:
             mapping.setdefault(self.model.config.layer_types[i], i)
 
         return mapping
+
+    def _compute_effective_alpha(self, token_position):
+        if self.alpha_ramp:
+            return min(token_position/10, 1) * self.alpha
+
+        return self.alpha
 
     def recirculated_run(self,
             input_ids,
@@ -137,7 +152,8 @@ class RecirculatedGemma:
                     position_ids=position_ids[:, token_position:token_position+2*K],
                     position_embeddings=self._slice_position_embeddings(position_embeddings, start=token_position, end=token_position+2*K),
                     causal_mask_mapping=causal_mask_mapping,
-                    K=K
+                    K=K,
+                    alpha=self._compute_effective_alpha(token_position)
                 )
 
                 self.final_hidden_states.append(hidden_states_block[:, K:2*K, :])
@@ -192,12 +208,13 @@ class RecirculatedGemma:
             position_ids,
             position_embeddings,
             causal_mask_mapping,
-            K
+            K,
+            alpha
         ):
         """Recirculated pass for block size K and normal pass for the subsequent block size K.""" 
         source_scaled = self.source_hidden  * (self.destination_hidden.norm(dim=-1, keepdim=True) / self.source_hidden.norm(dim=-1, keepdim=True))
 
-        recirculated_token = self.alpha * source_scaled + self.beta * self.destination_hidden
+        recirculated_token = alpha * source_scaled + self.beta * self.destination_hidden
 
         hidden_states = torch.cat([recirculated_token, hidden_states], dim=1)
 
@@ -381,7 +398,8 @@ class RecirculatedGemma:
                     position_ids=position_ids,
                     position_embeddings=position_embeddings,
                     causal_mask_mapping=causal_mask_mapping,
-                    K=K
+                    K=K,
+                    alpha=self._compute_effective_alpha(token_position = input_sequence_len - K - 1)
                 )
 
                 # Accumulate final hidden states
