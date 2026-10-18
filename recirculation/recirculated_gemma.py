@@ -27,30 +27,20 @@ class RecirculatedGemma:
         self.final_hidden_states = []
 
         lower_layers = range(self.destination + 1)
-
-        self.lower_full_layers = next(
-            i for i in lower_layers
-            if self.model.config.layer_types[i] == "full_attention"
-        )
-        self.lower_sliding_layers = next(
-            i for i in lower_layers
-            if self.model.config.layer_types[i] == "sliding_attention"
-        )
-
         upper_layers = range(
             self.destination + 1,
             self.model.config.num_hidden_layers
         )
 
-        self.upper_full_layers = next(
-            i for i in upper_layers
-            if self.model.config.layer_types[i] == "full_attention"
-        )
+        self.lower_layers_attention = self._create_layer_attention_mappings(layer_range=lower_layers)
+        self.upper_layers_attention = self._create_layer_attention_mappings(layer_range=upper_layers)
 
-        self.upper_sliding_layers = next(
-            i for i in upper_layers
-            if self.model.config.layer_types[i] == "sliding_attention"
-        )
+    def _create_layer_attention_mappings(self, layer_range):
+        mapping = {}
+        for i in layer_range:
+            mapping.setdefault(self.model.config.layer_types[i], i)
+
+        return mapping
 
     def recirculated_run(self,
             input_ids,
@@ -95,7 +85,8 @@ class RecirculatedGemma:
                 attention_mask=attention_mask,
                 token_position=None,
                 past_key_values=self.past_key_values,
-                position_ids=position_ids
+                position_ids=position_ids,
+                mask_layer_indices=self.lower_layers_attention
             )
 
             for layer in range(self.destination + 1):
@@ -117,7 +108,8 @@ class RecirculatedGemma:
                 attention_mask=attention_mask,
                 token_position=0,
                 past_key_values=None,
-                position_ids=position_ids
+                position_ids=position_ids,
+                mask_layer_indices=self.upper_layers_attention
             )
             warmup_state = self.warmup_pass(
                 hidden_states=hidden_states[:, 0:1, :].clone(),
@@ -136,7 +128,8 @@ class RecirculatedGemma:
                     attention_mask=attention_mask,
                     token_position=token_position,
                     past_key_values=self.past_key_values,
-                    position_ids=position_ids
+                    position_ids=position_ids,
+                    mask_layer_indices=self.upper_layers_attention
                 )
 
                 hidden_states_block = self.recirculated_block_pass(
@@ -355,10 +348,7 @@ class RecirculatedGemma:
                     token_position=None,
                     past_key_values=self.past_key_values,
                     position_ids=position_ids[:,-K:],
-                    mask_layer_indices={
-                        "full_attention": self.lower_full_layers,
-                        "sliding_attention": self.lower_sliding_layers
-                    }
+                    mask_layer_indices=self.lower_layers_attention
                 )
 
                 for layer in range(self.destination + 1):
@@ -382,7 +372,8 @@ class RecirculatedGemma:
                     attention_mask=attention_mask,
                     token_position=None,
                     past_key_values=self.past_key_values,
-                    position_ids=position_ids
+                    position_ids=position_ids,
+                    mask_layer_indices=self.upper_layers_attention
                 )
 
                 hidden_states = self.recirculated_block_pass(
@@ -430,7 +421,7 @@ class RecirculatedGemma:
             token_position,
             past_key_values,
             position_ids,
-            mask_layer_indices=None
+            mask_layer_indices
         ):
         if token_position is not None:
             num_of_tokens = input_embeddings.shape[1]
@@ -438,12 +429,6 @@ class RecirculatedGemma:
 
             attention_mask = attention_mask[:, :end]
             position_ids = position_ids[:, token_position:end]
-
-        if mask_layer_indices is None:
-            mask_layer_indices = {
-                "full_attention": self.upper_full_layers,
-                "sliding_attention": self.upper_sliding_layers
-            }
         
         mask_kwargs = {
             "config": self.model.config,
@@ -452,15 +437,14 @@ class RecirculatedGemma:
             "past_key_values": past_key_values,
             "position_ids": position_ids,
         }
-
-        sliding_mask_kwargs = mask_kwargs.copy()
         
         # Create the masks
-        # The lower-stack mask mapping assumes destination > 0; destination=0 is not supported yet.
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs, layer_idx=mask_layer_indices["full_attention"]),
-            "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs, layer_idx=mask_layer_indices["sliding_attention"]),
-        }
+        causal_mask_mapping = {}
+
+        if "full_attention" in mask_layer_indices.keys():
+            causal_mask_mapping["full_attention"] = create_causal_mask(**mask_kwargs, layer_idx=mask_layer_indices["full_attention"])
+        if "sliding_attention" in mask_layer_indices.keys():
+            causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs, layer_idx=mask_layer_indices["sliding_attention"])
 
         return causal_mask_mapping
 

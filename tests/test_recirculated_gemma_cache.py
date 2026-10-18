@@ -27,7 +27,11 @@ def assert_logits_close(actual, expected, *, rtol=1e-5, atol=1e-6):
 
 @pytest.fixture
 def tiny_gemma(monkeypatch, request):
-    device, dtype = getattr(request, "param", ("cpu", torch.float32))
+    params = getattr(request, "param", ("cpu", torch.float32))
+    device, dtype = params[:2]
+    layer_types = (
+        params[2] if len(params) == 3 else ["sliding_attention", "full_attention"] * 2
+    )
     if device == "cuda":
         if not torch.cuda.is_available():
             pytest.skip("CUDA is unavailable")
@@ -48,7 +52,7 @@ def tiny_gemma(monkeypatch, request):
         head_dim=8,
         sliding_window=4,
         max_position_embeddings=32,
-        layer_types=["sliding_attention", "full_attention"] * 2,
+        layer_types=layer_types,
     )
     config._attn_implementation = "eager"
     with torch.random.fork_rng(devices=[]):
@@ -61,7 +65,7 @@ def tiny_gemma(monkeypatch, request):
         return model.to(device=device, dtype=kwargs["torch_dtype"])
 
     monkeypatch.setattr(module.AutoModelForCausalLM, "from_pretrained", load_model)
-    # Both lower and upper stacks include sliding and full attention layers.
+    # By default both stacks include sliding and full attention layers.
     wrapper = module.RecirculatedGemma(source=2, destination=1, dtype=dtype)
     for parameter in wrapper.model.parameters():
         assert parameter.device.type == device
@@ -105,6 +109,37 @@ def test_zero_alpha_matches_vanilla_across_sliding_window(tiny_gemma, length):
         assert_logits_close(actual, expected, rtol=1e-2, atol=1e-5)
     else:
         assert_logits_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "tiny_gemma",
+    [
+        (
+            "cpu", torch.float32,
+            ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
+        )
+    ],
+    indirect=True,
+    ids=["sliding-only-lower"],
+)
+def test_sliding_only_lower_stack_matches_vanilla_across_window(tiny_gemma):
+    # Mirrors the 1B PT layout: no full-attention layer before the destination.
+    assert tiny_gemma.lower_layers_attention == {"sliding_attention": 0}
+    assert tiny_gemma.upper_layers_attention == {
+        "full_attention": 2, "sliding_attention": 3
+    }
+
+    tiny_gemma.alpha = 0.0
+    input_ids = torch.arange(2, 15, device=tiny_gemma.model.device).unsqueeze(0)
+    mask = torch.ones_like(input_ids)
+    expected, _ = tiny_gemma.vanilla_run(input_ids, mask)
+    actual, _ = tiny_gemma.recirculated_run(input_ids, mask)
+    assert_logits_close(actual, expected)
+
+    # Lower-layer KV was committed for every token; upper KV trails by one.
+    state = snapshot_generation_state(tiny_gemma)
+    assert state["lengths"] == [13, 13, 12, 12]
+    assert state["positions"] == state["lengths"]
 
 
 @execution_cases
