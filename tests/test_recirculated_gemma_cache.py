@@ -96,7 +96,7 @@ def test_zero_alpha_matches_vanilla_across_sliding_window(tiny_gemma, length):
     tiny_gemma.alpha = 0.0
     input_ids = torch.arange(2, 2 + length, device=tiny_gemma.model.device).unsqueeze(0)
     attention_mask = torch.ones_like(input_ids)
-    expected, _ = tiny_gemma.run_vanilla(input_ids, attention_mask)
+    expected, _ = tiny_gemma.vanilla_run(input_ids, attention_mask)
     actual, _ = tiny_gemma.recirculated_run(input_ids, attention_mask)
     # BF16 allows approximately one rounding unit across different execution
     # schedules. Evidence and the tighter invariant tolerances are in
@@ -332,7 +332,7 @@ def test_zero_alpha_generate_matches_vanilla_reference(tiny_gemma, prompt_length
         input_ids.clone(),
         attention_mask.clone(),
         max_new_tokens,
-        tiny_gemma.run_vanilla,
+        tiny_gemma.vanilla_run,
     )
 
     if tiny_gemma.model.dtype == torch.bfloat16:

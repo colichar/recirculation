@@ -464,7 +464,7 @@ class RecirculatedGemma:
 
         return causal_mask_mapping
 
-    def run_vanilla(self, input_ids, attention_mask=None):
+    def vanilla_run(self, input_ids, attention_mask=None):
         with torch.no_grad():
             outputs = self.model(
                         input_ids=input_ids,

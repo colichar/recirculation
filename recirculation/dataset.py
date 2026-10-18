@@ -58,6 +58,27 @@ def dataloader(tokenizer, split="test", window_size=1023, document_limit=None):
 
             yield window_ids, window_mask
 
+def evaluate_window(model, window_ids, window_mask, vanilla=False):
+    # Add batch dimension and move to model device
+    window_ids = window_ids.unsqueeze(0).to(model.model.device)
+    window_mask = window_mask.unsqueeze(0).to(model.model.device)
 
+    if vanilla:
+        logits, targets = model.vanilla_run(window_ids, window_mask)
+    else:
+        logits, targets = model.recirculated_run(window_ids, window_mask)
 
-    
+    logits = logits[:, :-1, :].float()  # The final logits are predictions for the next token ID
+    targets = targets[:, 1:]            # The token IDs from the next token are targets of the previous final logits
+    mask = window_mask[:, 1:]           # The mask needs to be shifted accordingly
+
+    log_probs = F.log_softmax(logits, dim=-1)
+    nll = F.nll_loss(
+        log_probs.reshape(-1, log_probs.size(-1)),      # Expects [N, C]
+        targets.reshape(-1),                            # Expects [N]
+        reduction="none"
+    )
+
+    valid_nll = nll[mask.reshape(-1).bool()]    # Mask PAD tokens
+
+    return valid_nll.sum().item(), valid_nll.numel()
