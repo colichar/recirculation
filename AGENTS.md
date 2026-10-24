@@ -90,6 +90,24 @@ Code should be:
 
 Prefer straightforward code over clever or highly abstract solutions. Optimize for a researcher being able to understand the implementation and relate it to the method being studied.
 
+## Documentation
+
+- Keep documentation lean, factual, and human-readable.
+- Focus on what is implemented, checked, or required; explain why only when needed to avoid misunderstanding.
+- Do not duplicate code, tables, or information already stated elsewhere.
+- For numerical validation, record coverage, tolerances, run commands, and verification status.
+- Keep tolerance rationale brief; omit debugging narratives and incidental measurements unless needed to justify a numerical threshold.
+
+### Docstrings
+
+- Start with one sentence stating the purpose; use only that sentence for simple helpers.
+- Document behavior and assumptions needed for correct use, not line-by-line implementation details.
+- Use Args, Returns (or Yields), and Raises sections when useful; omit unnecessary sections.
+- For tensor inputs and outputs, explain their shape and meaning where needed for correct use.
+- Describe return structure and meaningful side effects, especially cache updates or resets.
+- For classes, summarize their responsibility and important state; avoid duplicating method documentation.
+- Keep parameter names and documented behavior consistent with the code.
+
 ## Reproducibility and Users
 
 The project is currently optimized primarily for research by its author.

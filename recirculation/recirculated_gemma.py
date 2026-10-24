@@ -15,6 +15,7 @@ class RecirculatedGemma:
             model_revision="fcf18a2a879aab110ca39f8bffbccd5d49d8eb29",
             dtype: torch.dtype = torch.float32
             ):
+        # Evaluation relevant parameters
         self.source = source
         self.destination = destination
         self.alpha = alpha
@@ -22,6 +23,7 @@ class RecirculatedGemma:
         # Paper used beta = 1 for all experiments
         self.beta = 1
 
+        # Loading the model
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, revision=model_revision)
         self.model = AutoModelForCausalLM.from_pretrained( 
             model_name,
@@ -29,6 +31,10 @@ class RecirculatedGemma:
             device_map="auto",
             revision=model_revision
         )
+
+        self.model_config = self.model.config.get_text_config(decoder=True)
+        self.model_decoder = self.model.get_decoder()
+
         self.model.eval()
 
         self.past_key_values = None
@@ -40,7 +46,7 @@ class RecirculatedGemma:
         lower_layers = range(self.destination + 1)
         upper_layers = range(
             self.destination + 1,
-            self.model.config.num_hidden_layers
+            self.model_config.num_hidden_layers
         )
 
         self.lower_layers_attention = self._create_layer_attention_mappings(layer_range=lower_layers)
@@ -49,7 +55,7 @@ class RecirculatedGemma:
     def _create_layer_attention_mappings(self, layer_range):
         mapping = {}
         for i in layer_range:
-            mapping.setdefault(self.model.config.layer_types[i], i)
+            mapping.setdefault(self.model_config.layer_types[i], i)
 
         return mapping
 
@@ -83,7 +89,7 @@ class RecirculatedGemma:
 
             if reset_cache:
                 ## Empty Cache
-                self.past_key_values = RecirculationDynamicCache(config=self.model.config)
+                self.past_key_values = RecirculationDynamicCache(config=self.model_config)
 
             if input_embeddings is None:
                 ## Generate Embeddings
@@ -107,9 +113,9 @@ class RecirculatedGemma:
             )
 
             for layer in range(self.destination + 1):
-                layer_type = self.model.config.layer_types[layer]
+                layer_type = self.model_config.layer_types[layer]
                     
-                hidden_states = self.model.model.layers[layer].forward(
+                hidden_states = self.model_decoder.layers[layer].forward(
                     hidden_states=hidden_states,
                     position_embeddings=(position_embeddings[layer_type]["cos"], position_embeddings[layer_type]["sin"]),
                     attention_mask=causal_mask_mapping[layer_type],
@@ -161,7 +167,7 @@ class RecirculatedGemma:
                 self.final_hidden_states.append(hidden_states_block[:, K:2*K, :])
 
             final_hidden_states = torch.cat(self.final_hidden_states, dim=1)
-            final_hidden_states = self.model.model.norm(final_hidden_states)
+            final_hidden_states = self.model_decoder.norm(final_hidden_states)
             logits = self.model.lm_head(final_hidden_states)
 
             return logits, input_ids
@@ -185,16 +191,16 @@ class RecirculatedGemma:
         ):
         """Warmup pass for first token of a sequence."""
 
-        for layer in range(self.destination + 1, self.model.config.num_hidden_layers):
+        for layer in range(self.destination + 1, self.model_config.num_hidden_layers):
             if layer == self.destination + 1:
                 self.destination_hidden = hidden_states.clone()
 
             if layer == self.source + 1:
                 self.source_hidden = hidden_states.clone()
             
-            layer_type = self.model.config.layer_types[layer]
+            layer_type = self.model_config.layer_types[layer]
     
-            hidden_states = self.model.model.layers[layer].forward(
+            hidden_states = self.model_decoder.layers[layer].forward(
                 hidden_states=hidden_states,
                 position_embeddings=(position_embeddings[layer_type]["cos"], position_embeddings[layer_type]["sin"]),
                 attention_mask=causal_mask_mapping[layer_type],
@@ -220,16 +226,16 @@ class RecirculatedGemma:
 
         hidden_states = torch.cat([recirculated_token, hidden_states], dim=1)
 
-        for layer in range(self.destination + 1, self.model.config.num_hidden_layers):
+        for layer in range(self.destination + 1, self.model_config.num_hidden_layers):
             if layer == self.destination + 1:
                 self.destination_hidden = hidden_states[:, K:2*K, :].clone()
             
             if layer == self.source + 1:
                 self.source_hidden = hidden_states[:, K:2*K, :].clone()
 
-            layer_type = self.model.config.layer_types[layer]
+            layer_type = self.model_config.layer_types[layer]
 
-            hidden_states = self.model.model.layers[layer].forward(
+            hidden_states = self.model_decoder.layers[layer].forward(
                 hidden_states=hidden_states,
                 position_embeddings=(position_embeddings[layer_type]["cos"], position_embeddings[layer_type]["sin"]),
                 attention_mask=causal_mask_mapping[layer_type],
@@ -250,10 +256,10 @@ class RecirculatedGemma:
 
         hidden_states = self.alpha * source_scaled + self.beta * self.destination_hidden
 
-        for layer in range(self.destination + 1, self.model.config.num_hidden_layers):
-            layer_type = self.model.config.layer_types[layer]
+        for layer in range(self.destination + 1, self.model_config.num_hidden_layers):
+            layer_type = self.model_config.layer_types[layer]
 
-            hidden_states = self.model.model.layers[layer].forward(
+            hidden_states = self.model_decoder.layers[layer].forward(
                 hidden_states=hidden_states,
                 position_embeddings=(position_embeddings[layer_type]["cos"], position_embeddings[layer_type]["sin"]),
                 attention_mask=causal_mask_mapping[layer_type],
@@ -267,7 +273,7 @@ class RecirculatedGemma:
     def generate_input_embeddigs(self, input_ids):
         """Generates token input embeddings."""
         ## Token Embeddings
-        return self.model.model.embed_tokens.forward(input_ids=input_ids)
+        return self.model_decoder.embed_tokens.forward(input_ids=input_ids)
 
     def generate_position_embeddings(self, hidden_states, start=0, end=None):
         """Generate token positional embeddings."""
@@ -287,8 +293,8 @@ class RecirculatedGemma:
 
         position_embeddings = {}
 
-        for layer_type in set(self.model.config.layer_types):
-            cos, sin = self.model.model.rotary_emb(
+        for layer_type in set(self.model_config.layer_types):
+            cos, sin = self.model_decoder.rotary_emb(
                 hidden_states,
                 position_ids,
                 layer_type
@@ -315,7 +321,7 @@ class RecirculatedGemma:
             ## Prefill and first token prediction
 
             ## Empty Cache
-            self.past_key_values = RecirculationDynamicCache(config=self.model.config)
+            self.past_key_values = RecirculationDynamicCache(config=self.model_config)
 
             ## Generate Embeddings
             input_embeddings = self.generate_input_embeddigs(input_ids=input_ids)
@@ -371,11 +377,11 @@ class RecirculatedGemma:
                 )
 
                 for layer in range(self.destination + 1):
-                    layer_type = self.model.config.layer_types[layer]
+                    layer_type = self.model_config.layer_types[layer]
 
                     sliced_position_embeddings = self._slice_position_embeddings(position_embeddings, start=K, end=2*K)
                         
-                    hidden_states = self.model.model.layers[layer].forward(
+                    hidden_states = self.model_decoder.layers[layer].forward(
                         hidden_states=hidden_states,
                         position_embeddings=(sliced_position_embeddings[layer_type]["cos"], sliced_position_embeddings[layer_type]["sin"]),
                         attention_mask=causal_mask_mapping[layer_type],
@@ -408,7 +414,7 @@ class RecirculatedGemma:
                 final_hidden_state = hidden_states[:, K:2*K, :]
                 self.final_hidden_states.append(final_hidden_state)
 
-                final_hidden_state = self.model.model.norm(final_hidden_state)
+                final_hidden_state = self.model_decoder.norm(final_hidden_state)
                 next_logits = self.model.lm_head(final_hidden_state)
                 next_logits = next_logits[:, -1, :]
                 next_token_id = next_logits.argmax(dim=-1, keepdim=True)
@@ -451,7 +457,7 @@ class RecirculatedGemma:
             position_ids = position_ids[:, token_position:end]
         
         mask_kwargs = {
-            "config": self.model.config,
+            "config": self.model_config,
             "inputs_embeds": input_embeddings,
             "attention_mask": attention_mask,
             "past_key_values": past_key_values,

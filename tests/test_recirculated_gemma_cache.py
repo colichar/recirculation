@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import Gemma3ForCausalLM, Gemma3TextConfig
+from transformers import AutoModelForCausalLM, Gemma3Config, Gemma3TextConfig, SiglipVisionConfig
 
 
 execution_cases = pytest.mark.parametrize(
@@ -25,8 +25,13 @@ def assert_logits_close(actual, expected, *, rtol=1e-5, atol=1e-6):
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
 
+@pytest.fixture(params=["text", "multimodal"], ids=["1b-layout", "4b-layout"])
+def model_layout(request):
+    return request.param
+
+
 @pytest.fixture
-def tiny_gemma(monkeypatch, request):
+def tiny_gemma(monkeypatch, request, model_layout):
     params = getattr(request, "param", ("cpu", torch.float32))
     device, dtype = params[:2]
     layer_types = params[2] if len(params) >= 3 else ["sliding_attention", "full_attention"] * 2
@@ -53,10 +58,20 @@ def tiny_gemma(monkeypatch, request):
         max_position_embeddings=32,
         layer_types=layer_types,
     )
-    config._attn_implementation = "eager"
+    text_config = config
+    if model_layout == "multimodal":
+        config = Gemma3Config(
+            text_config=text_config,
+            vision_config=SiglipVisionConfig(
+                hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+                num_attention_heads=2, image_size=8, patch_size=2,
+            ),
+            mm_tokens_per_image=4,
+            image_token_index=31,
+        )
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(7)
-        model = Gemma3ForCausalLM(config).eval()
+        model = AutoModelForCausalLM.from_config(config, attn_implementation="eager").eval()
     # Exercise the real wrapper initialization without downloading weights or a tokenizer.
     monkeypatch.setattr(module.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: None)
     def load_model(*args, **kwargs):
@@ -68,6 +83,9 @@ def tiny_gemma(monkeypatch, request):
     wrapper = module.RecirculatedGemma(
         source=2, destination=1, dtype=dtype, alpha_ramp=alpha_ramp
     )
+    expected_decoder = model.model if model_layout == "text" else model.model.language_model
+    assert wrapper.model_decoder is expected_decoder
+    assert wrapper.model_config is text_config
     for parameter in wrapper.model.parameters():
         assert parameter.device.type == device
         assert parameter.dtype == dtype
@@ -90,7 +108,7 @@ def test_recirculated_run_rejects_none_mask_before_computation(tiny_gemma, monke
     def unexpected_embedding(*args, **kwargs):
         pytest.fail("Missing masks must be rejected before model computation")
 
-    monkeypatch.setattr(tiny_gemma.model.model.embed_tokens, "forward", unexpected_embedding)
+    monkeypatch.setattr(tiny_gemma.model_decoder.embed_tokens, "forward", unexpected_embedding)
     with pytest.raises(ValueError, match="attention_mask must not be None"):
         tiny_gemma.recirculated_run(torch.tensor([[2, 3]]), attention_mask=None)
 
@@ -112,6 +130,7 @@ def test_zero_alpha_matches_vanilla_across_sliding_window(tiny_gemma, length):
         assert_logits_close(actual, expected)
 
 
+@pytest.mark.parametrize("model_layout", ["text"])
 @pytest.mark.parametrize(
     "tiny_gemma",
     [
@@ -143,6 +162,7 @@ def test_sliding_only_lower_stack_matches_vanilla_across_window(tiny_gemma):
     assert state["positions"] == state["lengths"]
 
 
+@pytest.mark.parametrize("model_layout", ["text"])
 @pytest.mark.parametrize(
     "tiny_gemma",
     [
@@ -221,6 +241,138 @@ def test_future_tokens_do_not_change_earlier_logits(tiny_gemma):
 
 
 @execution_cases
+def test_right_padding_preserves_valid_logits(tiny_gemma):
+    tiny_gemma.alpha = 0.09
+    ids = torch.arange(2, 9, device=tiny_gemma.model.device).unsqueeze(0)
+    mask = torch.ones_like(ids)
+    expected, _ = tiny_gemma.recirculated_run(ids, mask)
+    pad_mask = torch.cat([mask, torch.zeros_like(mask[:, :2])], dim=1)
+    for padding in ([0, 0], [20, 21]):
+        padded_ids = torch.cat([ids, ids.new_tensor([padding])], dim=1)
+        actual, _ = tiny_gemma.recirculated_run(padded_ids, pad_mask)
+        assert_logits_close(actual[:, :ids.shape[1]], expected)
+
+
+class ReferenceHistory:
+    """Untruncated KV history for single-token reference passes, without cache helpers."""
+
+    def __init__(self, num_layers):
+        self.kv = [None] * num_layers
+        self.commit = False
+
+    def update(self, keys, values, layer_idx):
+        if self.kv[layer_idx] is None:
+            self.kv[layer_idx] = (keys[..., :0, :], values[..., :0, :])
+        old_keys, old_values = self.kv[layer_idx]
+        full = (
+            torch.cat([old_keys, keys], dim=-2),
+            torch.cat([old_values, values], dim=-2),
+        )
+        if self.commit:
+            self.kv[layer_idx] = full
+        return full
+
+
+@torch.no_grad()
+def sequential_recirculation_reference(wrapper, input_ids, attention_mask):
+    """K=1, constant alpha: read a token, then commit its separate recirculation.
+
+    Shares only the model's decoder modules with the implementation. All history
+    is retained; absolute-position masks enforce sliding attention independently
+    of cache eviction and the paired-pass mask/position calculations.
+    """
+    assert not wrapper.alpha_ramp
+    decoder = wrapper.model_decoder
+    config = wrapper.model_config
+    history = ReferenceHistory(config.num_hidden_layers)
+    first_pass_states = []
+
+    def run_layers(hidden, layers, position, commit):
+        history.commit = commit
+        position_ids = input_ids.new_tensor([[position]])
+        key_positions = torch.arange(position + 1, device=input_ids.device)
+        source = None
+        for layer_idx in layers:
+            layer_type = config.layer_types[layer_idx]
+            allowed = (key_positions <= position) & attention_mask[:, :position + 1].bool()
+            if layer_type == "sliding_attention":
+                allowed = allowed & (key_positions > position - config.sliding_window)
+            mask = hidden.new_zeros((input_ids.shape[0], 1, 1, position + 1))
+            mask.masked_fill_(~allowed[:, None, None, :], torch.finfo(hidden.dtype).min)
+            hidden = decoder.layers[layer_idx](
+                hidden_states=hidden,
+                position_embeddings=decoder.rotary_emb(hidden, position_ids, layer_type),
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=history,
+            )
+            if layer_idx == wrapper.source:
+                source = hidden
+        return hidden, source
+
+    lower = range(wrapper.destination + 1)
+    upper = range(wrapper.destination + 1, config.num_hidden_layers)
+    for position in range(input_ids.shape[1]):
+        embedded = decoder.embed_tokens(input_ids[:, position:position + 1])
+        destination, _ = run_layers(embedded, lower, position, commit=True)
+        first_pass, source = run_layers(destination, upper, position, commit=False)
+        first_pass_states.append(first_pass)
+        # Match the scoring boundary: the last token's upper KV stays uncommitted.
+        if position + 1 < input_ids.shape[1]:
+            normalized_source = source * (destination.norm(dim=-1, keepdim=True)
+                                          / source.norm(dim=-1, keepdim=True))
+            mixed = destination + wrapper.alpha * normalized_source  # paper beta = 1
+            run_layers(mixed, upper, position, commit=True)
+
+    logits = wrapper.model.lm_head(decoder.norm(torch.cat(first_pass_states, dim=1)))
+    return logits, history
+
+
+@execution_cases
+@pytest.mark.parametrize("length,padding", [(1, 0), (7, 0), (13, 2)])
+@pytest.mark.parametrize("alpha", [0.0, 0.09])
+def test_run_matches_sequential_reference_and_retained_kv(tiny_gemma, length, padding, alpha):
+    tiny_gemma.alpha = alpha
+    assert tiny_gemma.beta == 1
+    ids = torch.arange(2, 2 + length, device=tiny_gemma.model.device).unsqueeze(0)
+    mask = torch.ones_like(ids)
+    if padding:
+        # Check padded-query logits too: a valid-prefix-only check cannot detect
+        # ignored right-padding masks, since causality already excludes future PAD.
+        ids = torch.cat([ids, ids.new_zeros((1, padding))], dim=1)
+        mask = torch.cat([mask, mask.new_zeros((1, padding))], dim=1)
+    expected, history = sequential_recirculation_reference(tiny_gemma, ids, mask)
+    actual, _ = tiny_gemma.recirculated_run(ids, mask)
+    rtol, atol = (1e-2, 1e-5) if tiny_gemma.model.dtype == torch.bfloat16 else (1e-5, 1e-6)
+    assert_logits_close(actual, expected, rtol=rtol, atol=atol)
+    if alpha == 0:
+        vanilla, _ = tiny_gemma.vanilla_run(ids, mask)
+        assert_logits_close(expected, vanilla, rtol=rtol, atol=atol)
+
+    config = tiny_gemma.model_config
+    cache = tiny_gemma.past_key_values
+    for layer_idx, layer in enumerate(cache.layers):
+        committed = ids.shape[1] if layer_idx <= tiny_gemma.destination else ids.shape[1] - 1
+        assert cache.get_seq_length(layer_idx) == committed
+        assert cache.get_query_offset(layer_idx) == committed
+        sliding = config.layer_types[layer_idx] == "sliding_attention"
+        retained = min(committed, config.sliding_window - 1) if sliding else committed
+        for actual_kv, reference_kv in zip((layer.keys, layer.values), history.kv[layer_idx], strict=True):
+            assert reference_kv.shape[-2] == committed
+            if retained == 0:
+                # HF initializes full-attention storage as a 1-D empty tensor.
+                assert actual_kv.numel() == 0
+                continue
+            assert actual_kv.shape[-2] == retained
+            # Separate single-token and paired matmuls differ slightly after key
+            # normalization (observed CPU FP32 max_abs=1.49e-6, key scale=2.01).
+            kv_atol = 3e-6 if tiny_gemma.model.dtype == torch.float32 else atol
+            torch.testing.assert_close(
+                actual_kv, reference_kv[..., committed - retained:, :], rtol=rtol, atol=kv_atol
+            )
+
+
+@execution_cases
 @pytest.mark.parametrize("length", [1, 7])
 def test_recirculated_run_returns_first_pass_readout(tiny_gemma, monkeypatch, length):
     tiny_gemma.alpha = 0.25
@@ -248,9 +400,9 @@ def test_recirculated_run_returns_first_pass_readout(tiny_gemma, monkeypatch, le
 
     with torch.no_grad():
         expected_first = tiny_gemma.model.lm_head(
-            tiny_gemma.model.model.norm(torch.cat(first_pass_states, dim=1))
+            tiny_gemma.model_decoder.norm(torch.cat(first_pass_states, dim=1))
         )
-    assert actual.shape == (1, length, tiny_gemma.model.config.vocab_size)
+    assert actual.shape == (1, length, tiny_gemma.model_config.vocab_size)
     # Compare all positions, including the warmup and paired-pass boundaries.
     assert_logits_close(actual, expected_first)
 
@@ -288,7 +440,7 @@ def snapshot_generation_state(wrapper):
 def assert_generation_state_matches_reference(actual, expected, wrapper, processed_length):
     assert actual["lengths"] == expected["lengths"] == [
         processed_length if i <= wrapper.destination else processed_length - 1
-        for i in range(wrapper.model.config.num_hidden_layers)
+        for i in range(wrapper.model_config.num_hidden_layers)
     ]
     assert actual["positions"] == expected["positions"] == actual["lengths"]
     rtol, atol = (1e-2, 1e-5) if wrapper.model.dtype == torch.bfloat16 else (1e-5, 1e-6)
@@ -366,7 +518,7 @@ def test_generation_prefill_and_first_decoding_transition(
 
     with monkeypatch.context() as hooks:
         for layer_idx in lower_positions:
-            layer = tiny_gemma.model.model.layers[layer_idx]
+            layer = tiny_gemma.model_decoder.layers[layer_idx]
             hooks.setattr(layer, "forward", capture_lower_forward(layer_idx, layer.forward))
         hooks.setattr(module, "RecirculationDynamicCache", create_cache)
         _, generated_ids = tiny_gemma.recirculated_generate(
