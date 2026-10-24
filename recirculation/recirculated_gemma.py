@@ -12,6 +12,7 @@ class RecirculatedGemma:
             alpha=0.25,
             alpha_ramp=False,
             model_name="google/gemma-3-1b-it",
+            model_revision="fcf18a2a879aab110ca39f8bffbccd5d49d8eb29",
             dtype: torch.dtype = torch.float32
             ):
         self.source = source
@@ -21,11 +22,12 @@ class RecirculatedGemma:
         # Paper used beta = 1 for all experiments
         self.beta = 1
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, revision=model_revision)
         self.model = AutoModelForCausalLM.from_pretrained( 
             model_name,
             torch_dtype=dtype,
             device_map="auto",
+            revision=model_revision
         )
         self.model.eval()
 
