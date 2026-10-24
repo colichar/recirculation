@@ -29,10 +29,10 @@ def dataloader(tokenizer, split="test", window_size=1023, document_limit=None):
     if document_limit is not None:
         dataset = dataset.take(document_limit)
 
-    for sample in dataset:
+    for document_idx, document in enumerate(dataset):
 
         inputs = tokenizer(
-            sample["text"],
+            document["text"],
             return_tensors="pt",
             add_special_tokens=False
         )
@@ -40,11 +40,11 @@ def dataloader(tokenizer, split="test", window_size=1023, document_limit=None):
         total_tokens = inputs["input_ids"].shape[-1]
         num_of_full_windows = total_tokens // window_size
 
-        for idx in range(num_of_full_windows):
-            window_ids = F.pad(inputs["input_ids"][:, window_size * idx : window_size * (idx + 1)].squeeze(0), (1, 0), value=tokenizer.bos_token_id)
-            window_mask = F.pad(inputs["attention_mask"][:, window_size * idx : window_size * (idx + 1)].squeeze(0), (1, 0), value=1)
+        for window_idx in range(num_of_full_windows):
+            window_ids = F.pad(inputs["input_ids"][:, window_size * window_idx : window_size * (window_idx + 1)].squeeze(0), (1, 0), value=tokenizer.bos_token_id)
+            window_mask = F.pad(inputs["attention_mask"][:, window_size * window_idx : window_size * (window_idx + 1)].squeeze(0), (1, 0), value=1)
 
-            yield window_ids, window_mask
+            yield window_ids, window_mask, document_idx, window_idx
 
         if total_tokens - num_of_full_windows * window_size >= 32:
             window_ids = inputs["input_ids"][:, window_size * num_of_full_windows : ].squeeze(0)
@@ -56,4 +56,4 @@ def dataloader(tokenizer, split="test", window_size=1023, document_limit=None):
             window_mask = F.pad(window_mask, (1, 0), value=1)
             window_mask = F.pad(window_mask, (0, (window_size + 1) - leftover_tokens), value=0)
 
-            yield window_ids, window_mask
+            yield window_ids, window_mask, document_idx, num_of_full_windows
