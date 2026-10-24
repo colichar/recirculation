@@ -36,6 +36,6 @@ All logit comparisons and difference measurements are performed in FP32, allowin
 
 - Zero-alpha equivalence uses `rtol=1e-5`, `atol=1e-6` for CPU/CUDA FP32 and `rtol=1e-2`, `atol=1e-5` for CUDA BF16. The BF16 tolerance allows for rounding differences between vanilla and paired-pass execution.
 - Causality and first-pass readout checks use `rtol=1e-5`, `atol=1e-6` across all configurations because they compare matching computations.
-- Sequential-reference KV checks allow small rounding differences from the different execution order (1.49e−6 observed; 3e−6 absolute tolerance). These checks have passed on CPU FP32; CUDA verification remains pending.
+- Sequential-reference KV checks allow small rounding differences from the different execution order (1.49e−6 observed; 3e−6 absolute tolerance). These checks have passed on CPU FP32 and CUDA FP32/BF16.
 
-These tolerances apply to the tiny integration model. Unexpected failures should be investigated before increasing them.
+These tolerances apply only to the tiny, randomly initialized integration models. Manual comparisons with google/gemma-3-4b-pt exceeded them; no separate numerical acceptance threshold has been set for the pretrained checkpoint. Unexpected test failures should be investigated before increasing tolerances.
