@@ -24,6 +24,9 @@ class Documents:
     def take(self, count):
         return Documents(self.documents[:count])
 
+    def skip(self, count):
+        return Documents(self.documents[count:])
+
 
 def document(tokens):
     return {"text": " ".join(map(str, tokens))}
@@ -39,9 +42,10 @@ def test_windows_keep_text_order_and_reset_at_document_boundaries(monkeypatch):
     windows = list(dataset_module.dataloader(Tokenizer()))
 
     assert len(windows) == 3
-    for (ids, mask), expected_text in zip(
-        windows, (first[:1023], first[1023:], second), strict=True
+    for (ids, mask, document_idx, window_idx), expected_text, expected_cursor in zip(
+        windows, (first[:1023], first[1023:], second), ((0, 0), (0, 1), (1, 0)), strict=True
     ):
+        assert (document_idx, window_idx) == expected_cursor
         assert ids.device.type == "cpu"
         assert ids.shape == mask.shape == (1024,)
         assert ids.tolist() == [Tokenizer.bos_token_id, *expected_text]
@@ -58,12 +62,36 @@ def test_final_fragment_31_is_discarded_and_32_is_padded(monkeypatch):
 
     windows = list(dataset_module.dataloader(Tokenizer()))
     assert len(windows) == 3
-    ids, mask = windows[-1]
+    ids, mask, document_idx, window_idx = windows[-1]
+    assert (document_idx, window_idx) == (1, 1)
     assert ids.shape == mask.shape == (1024,)
     assert ids[:33].tolist() == [Tokenizer.bos_token_id, *text[1023:]]
     assert ids[33:].tolist() == [Tokenizer.pad_token_id] * (1024 - 33)
     assert mask.tolist() == [1] * 33 + [0] * (1024 - 33)
     assert int(mask[1:].sum()) == 32
+
+
+def test_resume_after_padded_final_window_advances_to_next_document(monkeypatch):
+    first = list(range(100, 100 + 40 + 32))
+    second = list(range(200, 200 + 40))
+    monkeypatch.setattr(
+        dataset_module, "load_dataset",
+        lambda *args, **kwargs: Documents([document(first), document(second)]),
+    )
+
+    first_document = list(dataset_module.dataloader(Tokenizer(), window_size=40, document_limit=1))
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in first_document] == [(0, 0), (0, 1)]
+    assert first_document[-1][1].tolist() == [1] * 33 + [0] * 8
+
+    resumed = list(dataset_module.dataloader(
+        Tokenizer(), window_size=40, document_limit=2,
+        start_document_idx=0, start_window_idx=2,
+    ))
+    assert len(resumed) == 1
+    ids, mask, document_idx, window_idx = resumed[0]
+    assert (document_idx, window_idx) == (1, 0)
+    assert ids.tolist() == [Tokenizer.bos_token_id, *second]
+    assert mask.tolist() == [1] * 41
 
 
 def test_document_limit_and_pinned_streaming_split(monkeypatch):
@@ -81,7 +109,7 @@ def test_document_limit_and_pinned_streaming_split(monkeypatch):
 
     assert len(limited) == 1
     assert limited[0][0][1].item() == 10
-    assert [ids[1].item() for ids, _ in full] == [10, 20, 30]
+    assert [ids[1].item() for ids, _, _, _ in full] == [10, 20, 30]
     assert calls == [
         (("emozilla/pg19",), {
             "split": "test",
