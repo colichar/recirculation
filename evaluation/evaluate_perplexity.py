@@ -1,3 +1,4 @@
+import os
 import math
 import torch.nn.functional as F
 import json
@@ -51,33 +52,85 @@ def score_window_nll(model, window_ids, window_mask, mode="vanilla"):
 
     return valid_nll.sum().item(), valid_nll.numel()
 
-def evaluate_perplexity(model, document_limit=None, window_limit=None):
+def evaluate_perplexity(
+        model,
+        dataloader_config,
+        checkpoint = None,
+        document_limit=None,
+        window_limit=None,
+        on_window=None
+        ):
     """Evaluate vanilla and Recirculation perplexity on paired PG-19 windows.
 
-    Stream each independent BOS-prefixed window once and score both modes on
-    the same input IDs and valid target positions. For each mode, compute
-    perplexity from its summed NLL divided by its total scored-token count.
-    Raise ValueError if the modes have different total scored-token counts.
+    Score both modes on the same BOS-prefixed windows and valid target positions.
+    When resuming, continue after the checkpoint's last completed window and add
+    new scores to its cumulative totals.
 
     Args:
-        model: RecirculatedGemma instance, including its tokenizer and
-            Recirculation configuration.
-        document_limit: Number of first test documents to evaluate, or None
-            for the full test split.
+        model: RecirculatedGemma instance, including its tokenizer.
+        dataloader_config: Keyword arguments for dataloader, excluding tokenizer,
+            resume indices, and document_limit.
+        checkpoint: Saved checkpoint object with a last-window cursor and
+            cumulative results, or None for a fresh run. Its NLL and token-count
+            dictionaries are updated in place.
+        document_limit: Cap on documents from the start of the split, or None
+            for the full split.
+        window_limit: Maximum additional windows to score in this invocation,
+            or None to score all remaining selected windows.
+        on_window: Optional callback called after both modes complete a window.
+            Receives (document_idx, window_idx, total_nll_sum, total_tokens,
+            total_documents, total_windows).
 
     Returns:
-        A tuple (perplexity_by_mode, token_counts_by_mode, window_count).
-        The first two values are dictionaries keyed by "vanilla" and
-        "recirculated"; window_count is shared by both modes.
+        A seven-item tuple containing, in order:
+            perplexity: Dict mapping "vanilla" and "recirculated" to perplexity
+                computed from cumulative NLL and scored-token counts.
+            total_nll_sum: Dict of cumulative summed NLL for each mode.
+            total_tokens: Dict of cumulative scored-token counts for each mode.
+            total_documents: Cumulative number of documents with at least one
+                scored window.
+            total_windows: Cumulative number of scored windows.
+            document_idx: Zero-based index of the last completed document.
+            window_idx: Zero-based index of the last completed window within
+                that document.
+
+    Raises:
+        ValueError: If the modes have different scored-token counts or no
+            windows have been scored in total.
     """
-    total_nll_sum = {mode: 0 for mode in MODES}
-    total_tokens = {mode: 0 for mode in MODES}
-    total_windows = 0
-    
+    if checkpoint is None:
+        total_nll_sum = {mode: 0 for mode in MODES}
+        total_tokens = {mode: 0 for mode in MODES}
+        total_windows = 0
+        total_documents = 0
+        start_windows = 0
+        start_window_idx = 0
+        start_document_idx = 0
+        last_scored_document_idx = None
+    else:
+        total_nll_sum = checkpoint["results"]["total_nll_sum"]
+        total_tokens = checkpoint["results"]["total_tokens"]
+        total_windows = checkpoint["results"]["total_windows"]
+        total_documents = checkpoint["results"]["total_documents"]
+        start_windows = checkpoint["results"]["total_windows"]
+
+        document_idx = checkpoint["last_document_idx"]
+        window_idx = checkpoint["last_window_idx"]
+        start_document_idx = document_idx
+        start_window_idx = window_idx + 1
+        last_scored_document_idx = checkpoint["last_document_idx"]
+
+
     for window_ids, window_mask, document_idx, window_idx in tqdm(
-        dataloader(tokenizer=model.tokenizer, document_limit=document_limit),
+        dataloader(
+            tokenizer=model.tokenizer,
+            start_document_idx=start_document_idx,
+            start_window_idx=start_window_idx,
+            document_limit=document_limit,
+            **dataloader_config
+            ),
         desc="PG-19 · vanilla + recirc",
-        unit="window",
+        unit=" window",
         dynamic_ncols=True,
         ):
         for mode in MODES:
@@ -90,85 +143,158 @@ def evaluate_perplexity(model, document_limit=None, window_limit=None):
             total_nll_sum[mode] += nll_sum
             total_tokens[mode] += num_tokens
         total_windows += 1
-        if window_limit is not None and total_windows == window_limit:
+        if document_idx != last_scored_document_idx:
+            total_documents += 1
+            last_scored_document_idx = document_idx
+        if on_window is not None:
+            on_window(document_idx, window_idx, total_nll_sum, total_tokens, total_documents, total_windows)
+        if window_limit is not None and total_windows == window_limit + start_windows:
             print(f"Reached {window_limit} windows, stopping evaluation at document {document_idx}, window {window_idx}")
             break
 
     if total_tokens["vanilla"] != total_tokens["recirculated"]:
         raise ValueError(f"Scored-token counts differ: {total_tokens}")
+    if total_windows == 0:
+        raise ValueError("No windows were scored")
 
     perplexity = {mode: math.exp(total_nll_sum[mode] / total_tokens[mode]) for mode in MODES}
 
-    return perplexity, total_nll_sum, total_tokens, total_windows
+    return perplexity, total_nll_sum, total_tokens, total_documents, total_windows, document_idx, window_idx
 
-def save_run_metadata(metadata):
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
+def save_run_metadata(metadata, output):
+    """Atomically replace a run's JSON file with its current metadata.
 
-    dataset_name = metadata["meta"]["dataset_name"].split("/")[-1]
-    model_name = metadata["parameters"]["model_name"].split("/")[-1]
+    Write to a temporary file beside the output, then replace the output so an
+    interrupted write does not leave a partially written checkpoint.
 
-    output = results_dir / f"{dataset_name}-{model_name}-{metadata["meta"]["started_at"].replace(':', '-')}.json"
-
-    with output.open("x", encoding="utf-8") as file:
-        json.dump(metadata, file, indent=2)
+    Args:
+        metadata: JSON-serializable run metadata and checkpoint.
+        output: Path of the run's JSON file.
+    """
+    output.parent.mkdir(exist_ok=True)
+    temporary = output.with_name(output.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as file:
+            json.dump(metadata, file, indent=2)
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
+    # Load Config
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config", type=Path, help="JSON experiment configuration")
+    parser.add_argument("--resume-from", type=Path, help="Saved run JSON")
+    parser.add_argument("--document-limit", type=int, default=None, help="Limits the full dataset to the first document_limit documents")
+    parser.add_argument("--window-limit", type=int, help="Limits the evaluation run to window_limit windows")
+    args = parser.parse_args()
+
+    config = json.loads(args.config.read_text(encoding="utf-8"))
+    dataloader_config = config["dataloader"]
+    model_config = config["model_parameters"]
+
+    previous_run = None
+
+    if args.resume_from is not None:
+        previous_run = json.loads(args.resume_from.read_text(encoding="utf-8"))
+        for section in ("dataloader", "model_parameters"):
+            if previous_run[section] != config[section]:
+                raise ValueError(f"Cannot resume: {section} differs from the saved run")
+
+    checkpoint = previous_run["checkpoint"] if previous_run is not None else None
+
+    document_limit = args.document_limit
+    window_limit = args.window_limit
+
+    # Load model
     import torch
     from recirculation.recirculated_gemma import RecirculatedGemma
 
     started_at = datetime.now(timezone.utc).isoformat()
 
-    model = RecirculatedGemma(
-        source=10,
-        destination=4,
-        alpha=0.07,
-        alpha_ramp=True,
-        model_name="google/gemma-3-1b-pt",
-        model_revision="fcf18a2a879aab110ca39f8bffbccd5d49d8eb29",
-        dtype=torch.float32
-    )
+    dtype_by_name = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }
 
-    perplexity, total_nll_sum, total_tokens, total_windows = evaluate_perplexity(
-        model=model,
-        document_limit=1
-    )
+    model_kwargs = model_config.copy()
+    model_kwargs["dtype"] = dtype_by_name[model_kwargs["dtype"]]
+    model = RecirculatedGemma(**model_kwargs)
 
-    save_run_metadata(
-        metadata={
-            "meta": {
-                "dataset_name": "emozilla/pg19",
-                "dataset_revision": "c021754c8e01c5b1cc83a1f549c1f97fbbb756b8",
-                "dataset_split": "test",
-                "started_at": started_at,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "window_prefix": "BOS"
-            },
-            "parameters": {
-                "source": 10,
-                "destination": 4,
-                "alpha": 0.07,
-                "alpha_ramp": True,
-                "model_name": "google/gemma-3-1b-pt",
-                "model_revision": "fcf18a2a879aab110ca39f8bffbccd5d49d8eb29",
-                "dtype": str(model.model.dtype)
-            },
-            "results": {
-                "perplexity": perplexity,
-                "total_nll_sum": total_nll_sum,
-                "total_tokens": total_tokens,
-                "total_windows": total_windows
-            },
-            "checkpoint": {
-                # TODO: Needds to add the proper document and windows idx to continue from
-                # The idx needs to be properly continue in the next run, see current `evaluate_perplexity` implementation
-                # total_windows reflects the checkpoint windows idx for the first run only, need to see how to get the proper idx
-                "last_window_idx": "",
-                "last_document_idx": ""
-            }
+    import subprocess
+
+    metadata={
+        "meta": {
+            "evaluation": "perplexity",
+            "started_at": started_at,
+            "finished_at": None
+        },
+        "dataloader": dataloader_config,
+        "model_parameters": model_config,
+        "window_limit": window_limit,
+        "document_limit": document_limit,
+        "checkpoint": None,
+        "provenance": {
+            "git_commit": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True
+            ).strip(),
+            "git_dirty": bool(subprocess.check_output(
+                ["git", "status", "--porcelain"], text=True
+            ).strip()),
+            "beta": model.beta,
+            "alpha_ramp_steps": 10 if model.alpha_ramp else None
         }
+    }
+
+    dataset_name = dataloader_config["name"].split("/")[-1]
+    model_name = model_config["model_name"].split("/")[-1]
+    output = Path("results") / (
+        f"{dataset_name}-{model_name}-{started_at.replace(':', '-')}.json"
     )
+
+    def record_window(document_idx, window_idx, total_nll_sum, total_tokens, total_documents, total_windows):
+        if total_tokens["vanilla"] != total_tokens["recirculated"]:
+            raise ValueError(f"Scored-token counts differ: {total_tokens}")
+
+        metadata["checkpoint"] = {
+            "last_document_idx": document_idx,
+            "last_window_idx": window_idx,
+            "results": {
+                "perplexity": {
+                    mode: math.exp(total_nll_sum[mode] / total_tokens[mode])
+                    for mode in MODES
+                },
+                "total_nll_sum": total_nll_sum.copy(),
+                "total_tokens": total_tokens.copy(),
+                "total_windows": total_windows,
+                "total_documents": total_documents,
+            },
+        }
+        save_run_metadata(metadata, output)
+
+
+    # Run evaluation
+    dataloader_kwargs = dataloader_config.copy()
+    dataloader_kwargs.pop("window_prefix", None) # window_prefix is currently an unused parameter
+    perplexity, total_nll_sum, total_tokens, total_documents, total_windows, document_idx, window_idx = evaluate_perplexity(
+        model=model,
+        dataloader_config=dataloader_kwargs,
+        checkpoint=checkpoint,
+        document_limit=document_limit,
+        window_limit=window_limit,
+        on_window=record_window
+    )
+
+    # Save metadata
+    if metadata["checkpoint"] is None:
+        metadata["checkpoint"] = checkpoint
+
+    metadata["meta"]["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    save_run_metadata(metadata, output)
 
     print(f"Evaluation ran for {total_windows} windows and {total_tokens["vanilla"]} tokens\n")
     for mode in MODES:
