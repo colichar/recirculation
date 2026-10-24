@@ -31,7 +31,7 @@ The selected states are concatenated in token order, then passed through final n
 Let $h_{d,i}$ and $h_{s,i}$ be token $i$'s saved first-pass hidden states **after** the destination and source layers. Its recirculated input to layer `destination + 1` is:
 
 $$
-\widetilde{h}_i = (1 - \alpha)h_{d,i} + \alpha\frac{\lVert h_{d,i}\rVert_2}{\lVert h_{s,i}\rVert_2}h_{s,i}.
+\widetilde{h}_i = \beta h_{d,i} + \alpha\frac{\lVert h_{d,i}\rVert_2}{\lVert h_{s,i}\rVert_2}h_{s,i}.
 $$
 
 The norm is computed over the hidden dimension for each token. The paired upper-layer input is $[\widetilde{h}_i,\ h_{d,i+1}]$: the previous token is mixed, while the new token uses its unchanged lower-layer output. Each token keeps its original position ID.
