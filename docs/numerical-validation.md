@@ -39,3 +39,11 @@ All logit comparisons and difference measurements are performed in FP32, allowin
 - Sequential-reference KV checks allow small rounding differences from the different execution order (1.49e−6 observed; 3e−6 absolute tolerance). These checks have passed on CPU FP32 and CUDA FP32/BF16.
 
 These tolerances apply only to the tiny, randomly initialized integration models. Manual comparisons with google/gemma-3-4b-pt exceeded them; no separate numerical acceptance threshold has been set for the pretrained checkpoint. Unexpected test failures should be investigated before increasing tolerances.
+
+## Optional pretrained-checkpoint smoke check
+
+Run this after substantial changes to inference, masking, cache handling, or Transformers—not as part of routine pytest. Load `google/gemma-3-4b-pt` with source 15, destination 8, alpha 0.09, beta 1, and no ramp.
+
+On the same short text inputs and at matching dtype, compare alpha-zero logits with vanilla logits and nonzero-alpha logits with the sequential reference in `tests/test_recirculated_gemma_cache.py`. Check causality and cache lengths, offsets, and retained KV. Report numerical differences rather than applying the tiny-model tolerances as checkpoint pass/fail limits.
+
+Record the checkpoint revision, code commit, hardware, dtype, input lengths, and results in the relevant PR or experiment record.
