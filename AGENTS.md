@@ -90,6 +90,14 @@ Code should be:
 
 Prefer straightforward code over clever or highly abstract solutions. Optimize for a researcher being able to understand the implementation and relate it to the method being studied.
 
+## Documentation
+
+- Keep documentation lean, factual, and human-readable.
+- Focus on what is implemented, checked, or required; explain why only when needed to avoid misunderstanding.
+- Do not duplicate code, tables, or information already stated elsewhere.
+- For numerical validation, record coverage, tolerances, run commands, and verification status.
+- Keep tolerance rationale brief; omit debugging narratives and incidental measurements unless needed to justify a numerical threshold.
+
 ## Reproducibility and Users
 
 The project is currently optimized primarily for research by its author.
