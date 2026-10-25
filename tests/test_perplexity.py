@@ -54,6 +54,22 @@ def test_window_nll_shifts_targets_and_excludes_padded_positions_in_both_modes()
         torch.testing.assert_close(seen_mask, mask.unsqueeze(0))
 
 
+def test_window_nll_without_bos_excludes_first_text_token():
+    ids = torch.tensor([1, 2, 3])
+    mask = torch.ones_like(ids)
+    logits = torch.tensor([
+        [0, 0, 8, 0],  # predicts text token 2
+        [0, 0, 0, 8],  # predicts text token 3
+        [0, 8, 0, 0],  # would predict token 1 if final logits were scored
+    ], dtype=torch.float32)
+    model = FakeModel({tuple(ids.tolist()): logits})
+
+    nll_sum, count = evaluation_module.score_window_nll(model, ids, mask)
+
+    assert count == 2
+    assert nll_sum == pytest.approx(2 * math.log1p(3 * math.exp(-8)), abs=1e-6)
+
+
 def test_perplexity_weights_windows_by_valid_token_count(monkeypatch):
     full_ids = torch.tensor([0, 1, 1])
     partial_ids = torch.tensor([0, 0, 0])
@@ -215,3 +231,39 @@ def test_failed_second_mode_keeps_last_complete_window_checkpoint(monkeypatch, t
     uninterrupted = evaluation_module.evaluate_perplexity(model, {"window_size": 2})
     assert resumed == uninterrupted
     assert (resumed[5], resumed[6]) == (0, 1)
+
+
+def test_first_only_resume_within_and_across_documents_matches_full_run(monkeypatch):
+    documents = [document(range(100, 100 + 40 + 41 + 32)), document(range(300, 340))]
+    monkeypatch.setattr(dataset_module, "load_dataset", lambda *args, **kwargs: Documents(documents))
+    model = SimpleNamespace(tokenizer=Tokenizer())
+    config = {"window_size": 40, "window_prefix": "first_only"}
+
+    def score_window_nll(model, window_ids, window_mask, mode):
+        return float(window_ids[1]) + (0.5 if mode == "recirculated" else 0), int(window_mask[1:].sum())
+
+    monkeypatch.setattr(evaluation_module, "score_window_nll", score_window_nll)
+
+    def checkpoint(result):
+        _, nll_sums, counts, document_count, window_count, document_idx, window_idx = result
+        return {
+            "last_document_idx": document_idx,
+            "last_window_idx": window_idx,
+            "results": {
+                "total_nll_sum": nll_sums.copy(),
+                "total_tokens": counts.copy(),
+                "total_documents": document_count,
+                "total_windows": window_count,
+            },
+        }
+
+    first = evaluation_module.evaluate_perplexity(model, config, window_limit=1)
+    second = evaluation_module.evaluate_perplexity(model, config, checkpoint=checkpoint(first), window_limit=1)
+    completed = evaluation_module.evaluate_perplexity(model, config, checkpoint=checkpoint(second))
+    full = evaluation_module.evaluate_perplexity(model, config)
+
+    assert (first[3], first[4], first[5:]) == (1, 1, (0, 0))
+    assert (second[3], second[4], second[5:]) == (1, 2, (0, 1))
+    assert completed == full
+    assert completed[2] == {"vanilla": 120, "recirculated": 120}
+    assert (completed[3], completed[4], completed[5:]) == (2, 3, (1, 0))

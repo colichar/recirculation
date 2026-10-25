@@ -9,15 +9,17 @@ def dataloader(
         split="test",
         revision="c021754c8e01c5b1cc83a1f549c1f97fbbb756b8",
         window_size=1023,
+        window_prefix="BOS",
         document_limit=None
         ):
-    """Yield independent, BOS-prefixed windows from the PG19 dataset.
+    """Yield independently scored windows from the streaming PG-19 dataset.
 
-    Each window contains up to `window_size` text tokens plus one BOS token.
-    This treats the paper's 1024-position context as BOS + 1023 text tokens;
-    the paper does not specify that packing detail. Final fragments with fewer
-    than 32 text tokens are discarded; retained fragments are right-padded.
-    
+    "BOS" prepends BOS to every window and retains final fragments with at
+    least 32 text tokens, padding them on the right. "first_only" prepends BOS
+    once per document, splits into full windows, and discards any final fragment.
+    Both policies use window_size + 1 positions; the paper does not specify
+    the exact BOS-plus-text accounting for its BOS-present windows.
+
     Args:
         tokenizer: Tokenizer used to encode document text.
         start_document_idx: Zero-based document index at which to resume.
@@ -26,15 +28,21 @@ def dataloader(
         name: Dataset repository name.
         split: Dataset split to stream.
         revision: Dataset revision to load.
-        window_size: Maximum text tokens per window, excluding BOS.
+        window_size: Text tokens per BOS-prefixed window; all windows have
+            window_size + 1 positions.
+        window_prefix: "BOS" for BOS in every window, or "first_only" for
+            BOS only in the first window of each document.
         document_limit: Cap on documents from the start of the split, applied
             before skipping to start_document_idx; None selects the full split.
 
     Yields:
         (window_ids, window_mask, document_idx, window_idx), where the first two
         are 1-D CPU tensors of length window_size + 1 and the indices are
-        zero-based. The mask is 1 for BOS and text, 0 for padding.
+        zero-based. The mask is 1 for present tokens, 0 for padding.
     """
+    if window_prefix not in ("BOS", "first_only"):
+        raise ValueError(f"Unknown window_prefix: {window_prefix}")
+
     dataset = load_dataset(
         name,
         split=split,
@@ -55,10 +63,25 @@ def dataloader(
             add_special_tokens=False
         )
 
+        first_window = start_window_idx if document_idx == start_document_idx else 0
+
+        if window_prefix == "first_only":
+            # The first window starts with BOS; later ones are text-only.
+            window_length = window_size + 1
+            sequence = F.pad(inputs["input_ids"].squeeze(0), (1, 0), value=tokenizer.bos_token_id)
+            sequence_mask = F.pad(inputs["attention_mask"].squeeze(0), (1, 0), value=1)
+            for window_idx in range(first_window, sequence.numel() // window_length):
+                start = window_idx * window_length
+                yield (
+                    sequence[start:start + window_length],
+                    sequence_mask[start:start + window_length],
+                    document_idx,
+                    window_idx,
+                )
+            continue
+
         total_tokens = inputs["input_ids"].shape[-1]
         num_of_full_windows = total_tokens // window_size
-
-        first_window = start_window_idx if document_idx == start_document_idx else 0
 
         for window_idx in range(first_window, num_of_full_windows):
             window_ids = F.pad(inputs["input_ids"][:, window_size * window_idx : window_size * (window_idx + 1)].squeeze(0), (1, 0), value=tokenizer.bos_token_id)

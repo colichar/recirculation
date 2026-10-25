@@ -94,6 +94,50 @@ def test_resume_after_padded_final_window_advances_to_next_document(monkeypatch)
     assert mask.tolist() == [1] * 41
 
 
+def test_first_only_packs_full_windows_and_resumes_across_documents(monkeypatch):
+    first = list(range(100, 100 + 40 + 41 + 32))
+    second = list(range(300, 300 + 40))
+    monkeypatch.setattr(
+        dataset_module, "load_dataset",
+        lambda *args, **kwargs: Documents([document(first), document(second)]),
+    )
+
+    kwargs = {"window_size": 40, "window_prefix": "first_only"}
+    windows = list(dataset_module.dataloader(Tokenizer(), **kwargs))
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in windows] == [
+        (0, 0), (0, 1), (1, 0)
+    ]
+    assert [ids.tolist() for ids, _, _, _ in windows] == [
+        [Tokenizer.bos_token_id, *first[:40]],
+        first[40:81],
+        [Tokenizer.bos_token_id, *second],
+    ]
+    for ids, mask, _, _ in windows:
+        assert ids.shape == mask.shape == (41,)
+        assert mask.tolist() == [1] * 41
+        assert int(mask[1:].sum()) == 40
+
+    within_document = list(dataset_module.dataloader(
+        Tokenizer(), **kwargs, start_document_idx=0, start_window_idx=1,
+    ))
+    across_documents = list(dataset_module.dataloader(
+        Tokenizer(), **kwargs, start_document_idx=0, start_window_idx=2,
+    ))
+    skipped_document = list(dataset_module.dataloader(
+        Tokenizer(), **kwargs, start_document_idx=1, start_window_idx=0,
+    ))
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in within_document] == [(0, 1), (1, 0)]
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in across_documents] == [(1, 0)]
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in skipped_document] == [(1, 0)]
+    for actual, expected in zip(within_document, windows[1:], strict=True):
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
+    torch.testing.assert_close(across_documents[0][0], windows[-1][0])
+    torch.testing.assert_close(across_documents[0][1], windows[-1][1])
+    torch.testing.assert_close(skipped_document[0][0], windows[-1][0])
+    torch.testing.assert_close(skipped_document[0][1], windows[-1][1])
+
+
 def test_document_limit_and_pinned_streaming_split(monkeypatch):
     documents = [document([value] * 1023) for value in (10, 20, 30)]
     calls = []

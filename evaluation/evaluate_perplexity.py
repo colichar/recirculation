@@ -11,18 +11,18 @@ MODES = ["vanilla", "recirculated"]
 
 
 def score_window_nll(model, window_ids, window_mask, mode="vanilla"):
-    """Score valid next-token targets in one BOS-prefixed window.
+    """Score valid next-token targets in one independent window.
 
     Run vanilla or Recirculation inference on the same input IDs and attention
-    mask. Logits at each position predict the following token; exclude BOS as
-    a target and exclude padded targets from the NLL sum. Log probabilities
-    are computed in FP32.
+    mask. Logits at each position predict the following token; the first token
+    in the window has no within-window predecessor and is not scored. Exclude
+    padded targets and compute log probabilities in FP32.
 
     Args:
         model: RecirculatedGemma instance used for inference.
         window_ids: 1-D token IDs for one window, initially on CPU.
-        window_mask: 1-D mask with 1 for BOS and text, 0 for padding.
-        vanilla: Use the vanilla forward pass instead of Recirculation.
+        window_mask: 1-D mask with 1 for present tokens, 0 for padding.
+        mode: "vanilla" or "recirculated" inference.
 
     Returns:
         A pair (summed NLL, scored-token count) for valid next-token targets.
@@ -62,7 +62,7 @@ def evaluate_perplexity(
         ):
     """Evaluate vanilla and Recirculation perplexity on paired PG-19 windows.
 
-    Score both modes on the same BOS-prefixed windows and valid target positions.
+    Score both modes on the same windows and valid target positions.
     When resuming, continue after the checkpoint's last completed window and add
     new scores to its cumulative totals.
 
@@ -277,11 +277,9 @@ if __name__ == "__main__":
 
 
     # Run evaluation
-    dataloader_kwargs = dataloader_config.copy()
-    dataloader_kwargs.pop("window_prefix", None) # window_prefix is currently an unused parameter
     perplexity, total_nll_sum, total_tokens, total_documents, total_windows, document_idx, window_idx = evaluate_perplexity(
         model=model,
-        dataloader_config=dataloader_kwargs,
+        dataloader_config=dataloader_config,
         checkpoint=checkpoint,
         document_limit=document_limit,
         window_limit=window_limit,
