@@ -80,9 +80,10 @@ def tiny_gemma(monkeypatch, request, model_layout):
 
     monkeypatch.setattr(module.AutoModelForCausalLM, "from_pretrained", load_model)
     # By default both stacks include sliding and full attention layers.
-    wrapper = module.RecirculatedGemma(
-        source=2, destination=1, dtype=dtype, alpha_ramp=alpha_ramp
-    )
+    wrapper_kwargs = {"source": 2, "destination": 1, "dtype": dtype, "alpha_ramp": alpha_ramp}
+    if len(params) >= 5:
+        wrapper_kwargs["beta"] = params[4]
+    wrapper = module.RecirculatedGemma(**wrapper_kwargs)
     expected_decoder = model.model if model_layout == "text" else model.model.language_model
     assert wrapper.model_decoder is expected_decoder
     assert wrapper.model_config is text_config
@@ -321,7 +322,7 @@ def sequential_recirculation_reference(wrapper, input_ids, attention_mask):
         if position + 1 < input_ids.shape[1]:
             normalized_source = source * (destination.norm(dim=-1, keepdim=True)
                                           / source.norm(dim=-1, keepdim=True))
-            mixed = destination + wrapper.alpha * normalized_source  # paper beta = 1
+            mixed = wrapper.beta * destination + wrapper.alpha * normalized_source
             run_layers(mixed, upper, position, commit=True)
 
     logits = wrapper.model.lm_head(decoder.norm(torch.cat(first_pass_states, dim=1)))
@@ -370,6 +371,28 @@ def test_run_matches_sequential_reference_and_retained_kv(tiny_gemma, length, pa
             torch.testing.assert_close(
                 actual_kv, reference_kv[..., committed - retained:, :], rtol=rtol, atol=kv_atol
             )
+
+
+@pytest.mark.parametrize(
+    "tiny_gemma",
+    [
+        ("cpu", torch.float32, ["sliding_attention", "full_attention"] * 2, False, 0.93),
+        ("cuda", torch.bfloat16, ["sliding_attention", "full_attention"] * 2, False, 0.93),
+    ],
+    ids=["cpu-fp32", "cuda-bf16"],
+    indirect=True,
+)
+def test_nonunit_beta_matches_sequential_reference(tiny_gemma):
+    assert tiny_gemma.beta == 0.93
+    tiny_gemma.alpha = 0.07
+    ids = torch.arange(2, 15, device=tiny_gemma.model.device).unsqueeze(0)
+    mask = torch.ones_like(ids)
+
+    expected, _ = sequential_recirculation_reference(tiny_gemma, ids, mask)
+    actual, _ = tiny_gemma.recirculated_run(ids, mask)
+
+    rtol, atol = (1e-2, 1e-5) if tiny_gemma.model.dtype == torch.bfloat16 else (1e-5, 1e-6)
+    assert_logits_close(actual, expected, rtol=rtol, atol=atol)
 
 
 @execution_cases

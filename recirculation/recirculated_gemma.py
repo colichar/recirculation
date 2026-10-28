@@ -13,15 +13,15 @@ class RecirculatedGemma:
             alpha_ramp=False,
             model_name="google/gemma-3-1b-it",
             model_revision="fcf18a2a879aab110ca39f8bffbccd5d49d8eb29",
-            dtype: torch.dtype = torch.float32
+            dtype: torch.dtype = torch.float32,
+            beta=1.0
             ):
         # Evaluation relevant parameters
         self.source = source
         self.destination = destination
         self.alpha = alpha
         self.alpha_ramp = alpha_ramp
-        # Paper used beta = 1 for all experiments
-        self.beta = 1
+        self.beta = beta
 
         # Loading the model
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, revision=model_revision)

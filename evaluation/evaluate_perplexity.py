@@ -251,7 +251,8 @@ if __name__ == "__main__":
 
     dataset_name = dataloader_config["name"].split("/")[-1]
     model_name = model_config["model_name"].split("/")[-1]
-    output = Path("results") / (
+    # Configs live in inputs/; save alongside that directory regardless of cwd.
+    output = args.config.parent.parent / "results" / (
         f"{dataset_name}-{model_name}-{started_at.replace(':', '-')}.json"
     )
 
