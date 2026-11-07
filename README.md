@@ -53,6 +53,17 @@ Full-attention layers retain all committed KV. Sliding-window layers retain at m
 
 After a sequence of length `N`, the lower layers have committed `N` positions and the upper layers `N - 1`, subject to sliding-window eviction. **The final token's upper-layer KV remains uncommitted.** Each `recirculated_run` call rebuilds the cache by default. For K = 1 autoregressive decoding, `recirculated_generate` reuses the cache across generated tokens within one request, selects next tokens from `recirculated_pass` logits, and resets the state between requests.
 
+## PG-19 perplexity results
+
+Gemma 3 1B PT on PG-19 test, with BOS only in each document's first window:
+
+| Result | Vanilla PPL | Recirculated PPL | Reduction |
+| --- | ---: | ---: | ---: |
+| [Paper, Table B.3](https://arxiv.org/html/2608.17981v3#A2.SS2) | 22.27 | 19.06 | 14.41% |
+| This project, original raw test files | 22.254 | 19.974 | 10.25% |
+
+The raw-CRLF evaluation scored 10,854,030 targets in 10,610 independent, full 1,024-position windows. The [input configuration](results/pg19-perplexity/inputs/pg19_1b_pt_bos_absent_raw_crlf.json) and [complete result](results/pg19-perplexity/results/pg19-raw-crlf-gemma-3-1b-pt-2026-10-28T20-25-34.422299+00-00.json) are under `results/`, alongside two smaller raw-run checkpoints. The numerical gap remains unresolved; see the [discrepancy investigation on issue #20](https://github.com/colichar/recirculation/issues/20#issuecomment-6705976964) for the checks performed and remaining questions.
+
 ## Environment setup
 
 Requirements:

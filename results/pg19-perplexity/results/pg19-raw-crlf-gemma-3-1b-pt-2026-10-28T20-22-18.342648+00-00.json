@@ -1,0 +1,53 @@
+{
+  "meta": {
+    "evaluation": "perplexity",
+    "started_at": "2026-10-28T20:22:18.342648+00:00",
+    "finished_at": "2026-10-28T20:22:41.439603+00:00"
+  },
+  "dataloader": {
+    "name": "deepmind/pg19",
+    "revision": "4d28bd77e66947ad3835cf78ed7aaeb4dd87ad8b",
+    "split": "test",
+    "source": "raw_pg19",
+    "window_size": 1023,
+    "window_prefix": "first_only"
+  },
+  "model_parameters": {
+    "source": 11,
+    "destination": 4,
+    "alpha": 0.07,
+    "beta": 0.93,
+    "alpha_ramp": false,
+    "model_name": "google/gemma-3-1b-pt",
+    "model_revision": "fcf18a2a879aab110ca39f8bffbccd5d49d8eb29",
+    "dtype": "bfloat16"
+  },
+  "window_limit": 2,
+  "document_limit": null,
+  "checkpoint": {
+    "last_document_idx": 0,
+    "last_window_idx": 1,
+    "results": {
+      "perplexity": {
+        "vanilla": 10.566064474511569,
+        "recirculated": 10.211766372467626
+      },
+      "total_nll_sum": {
+        "vanilla": 4823.74658203125,
+        "recirculated": 4753.964111328125
+      },
+      "total_tokens": {
+        "vanilla": 2046,
+        "recirculated": 2046
+      },
+      "total_windows": 2,
+      "total_documents": 1
+    }
+  },
+  "provenance": {
+    "git_commit": "af3b949177d6c485c539ca1595060786e337b377",
+    "git_dirty": true,
+    "beta": 0.93,
+    "alpha_ramp_steps": null
+  }
+}

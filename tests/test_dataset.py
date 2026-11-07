@@ -1,3 +1,5 @@
+from io import BytesIO
+
 import torch
 
 from recirculation import dataset as dataset_module
@@ -161,3 +163,71 @@ def test_document_limit_and_pinned_streaming_split(monkeypatch):
             "revision": "c021754c8e01c5b1cc83a1f549c1f97fbbb756b8",
         })
     ] * 2
+
+
+def test_raw_pg19_preserves_crlf_and_resumes_in_manifest_order(monkeypatch, tmp_path):
+    manifest = tmp_path / "test_files.txt"
+    manifest.write_text("test/02.txt\ntest/01.txt\ntest/03.txt\n", encoding="utf-8")
+    texts = {
+        "01.txt": b"A\r\nB\r\nC\r\nD",
+        "02.txt": b"W\r\nX",
+        "03.txt": b"Y\r\nZ",
+    }
+    calls = []
+
+    def download(*, repo_id, repo_type, revision, filename):
+        assert (repo_id, repo_type, revision, filename) == (
+            "deepmind/pg19", "dataset", "pinned-revision", "data/test_files.txt"
+        )
+        return str(manifest)
+
+    def open_book(url, timeout):
+        assert timeout == 60
+        name = url.rsplit("/", 1)[-1]
+        calls.append(name)
+        return BytesIO(texts[name])
+
+    class CharacterTokenizer:
+        bos_token_id = 2
+
+        def __call__(self, text, *, return_tensors, add_special_tokens):
+            assert return_tensors == "pt" and not add_special_tokens
+            ids = torch.tensor([[ord(char) for char in text]], dtype=torch.long)
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+    monkeypatch.setattr(dataset_module, "hf_hub_download", download)
+    monkeypatch.setattr(dataset_module, "urlopen", open_book)
+    kwargs = {
+        "name": "deepmind/pg19", "revision": "pinned-revision", "source": "raw_pg19",
+        "window_size": 3, "window_prefix": "first_only", "document_limit": 2,
+    }
+    windows = list(dataset_module.dataloader(CharacterTokenizer(), **kwargs))
+    assert calls == ["01.txt", "02.txt"]
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in windows] == [
+        (0, 0), (0, 1), (1, 0)
+    ]
+    assert [ids.tolist() for ids, _, _, _ in windows] == [
+        [2, ord("A"), 13, 10], [ord("B"), 13, 10, ord("C")], [2, ord("W"), 13, 10],
+    ]
+    assert all(mask.tolist() == [1] * 4 for _, mask, _, _ in windows)
+
+    calls.clear()
+    resumed = list(dataset_module.dataloader(
+        CharacterTokenizer(), **kwargs, start_document_idx=0, start_window_idx=1,
+    ))
+    assert calls == ["01.txt", "02.txt"]
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in resumed] == [(0, 1), (1, 0)]
+
+    calls.clear()
+    across_documents = list(dataset_module.dataloader(
+        CharacterTokenizer(), **kwargs, start_document_idx=0, start_window_idx=2,
+    ))
+    assert calls == ["01.txt", "02.txt"]
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in across_documents] == [(1, 0)]
+
+    calls.clear()
+    from_second = list(dataset_module.dataloader(
+        CharacterTokenizer(), **kwargs, start_document_idx=1,
+    ))
+    assert calls == ["02.txt"]
+    assert [(doc_idx, win_idx) for _, _, doc_idx, win_idx in from_second] == [(1, 0)]

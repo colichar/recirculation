@@ -1,5 +1,24 @@
+from pathlib import Path
+from urllib.request import urlopen
+
 import torch.nn.functional as F
 from datasets import load_dataset
+from huggingface_hub import hf_hub_download
+
+
+def pg19_raw_documents(name, revision, split, start_document_idx, document_limit):
+    """Yield original PG-19 books without normalizing their CRLF line endings."""
+    if name != "deepmind/pg19" or split != "test":
+        raise ValueError("Raw PG-19 evaluation requires deepmind/pg19, test split")
+
+    manifest = hf_hub_download(
+        repo_id=name, repo_type="dataset", revision=revision,
+        filename="data/test_files.txt",
+    )
+    filenames = sorted(Path(manifest).read_text(encoding="utf-8").splitlines())
+    for filename in filenames[start_document_idx:document_limit]:
+        with urlopen(f"https://storage.googleapis.com/deepmind-gutenberg/{filename}", timeout=60) as response:
+            yield {"text": response.read().decode("utf-8")}
 
 def dataloader(
         tokenizer,
@@ -10,9 +29,10 @@ def dataloader(
         revision="c021754c8e01c5b1cc83a1f549c1f97fbbb756b8",
         window_size=1023,
         window_prefix="BOS",
-        document_limit=None
+        document_limit=None,
+        source="huggingface",
         ):
-    """Yield independently scored windows from the streaming PG-19 dataset.
+    """Yield independently scored windows from PG-19 documents.
 
     "BOS" prepends BOS to every window and retains final fragments with at
     least 32 text tokens, padding them on the right. "first_only" prepends BOS
@@ -34,6 +54,8 @@ def dataloader(
             BOS only in the first window of each document.
         document_limit: Cap on documents from the start of the split, applied
             before skipping to start_document_idx; None selects the full split.
+        source: "huggingface" for the dataset loader, or "raw_pg19" to preserve
+            CRLF from the original DeepMind test files.
 
     Yields:
         (window_ids, window_mask, document_idx, window_idx), where the first two
@@ -43,17 +65,20 @@ def dataloader(
     if window_prefix not in ("BOS", "first_only"):
         raise ValueError(f"Unknown window_prefix: {window_prefix}")
 
-    dataset = load_dataset(
-        name,
-        split=split,
-        streaming=True,
-        revision=revision,
-    )
-
-    if document_limit is not None:
-        dataset = dataset.take(document_limit)
-
-    dataset = dataset.skip(start_document_idx)
+    if source == "raw_pg19":
+        dataset = pg19_raw_documents(name, revision, split, start_document_idx, document_limit)
+    elif source == "huggingface":
+        dataset = load_dataset(
+            name,
+            split=split,
+            streaming=True,
+            revision=revision,
+        )
+        if document_limit is not None:
+            dataset = dataset.take(document_limit)
+        dataset = dataset.skip(start_document_idx)
+    else:
+        raise ValueError(f"Unknown document source: {source}")
 
     for document_idx, document in enumerate(dataset, start=start_document_idx):
 

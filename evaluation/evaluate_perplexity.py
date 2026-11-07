@@ -250,6 +250,8 @@ if __name__ == "__main__":
     }
 
     dataset_name = dataloader_config["name"].split("/")[-1]
+    if dataloader_config.get("source") == "raw_pg19":
+        dataset_name += "-raw-crlf"
     model_name = model_config["model_name"].split("/")[-1]
     # Configs live in inputs/; save alongside that directory regardless of cwd.
     output = args.config.parent.parent / "results" / (

@@ -1,0 +1,20 @@
+{
+  "dataloader": {
+    "name": "deepmind/pg19",
+    "revision": "4d28bd77e66947ad3835cf78ed7aaeb4dd87ad8b",
+    "split": "test",
+    "source": "raw_pg19",
+    "window_size": 1023,
+    "window_prefix": "first_only"
+  },
+  "model_parameters": {
+    "source": 11,
+    "destination": 4,
+    "alpha": 0.07,
+    "beta": 0.93,
+    "alpha_ramp": false,
+    "model_name": "google/gemma-3-1b-pt",
+    "model_revision": "fcf18a2a879aab110ca39f8bffbccd5d49d8eb29",
+    "dtype": "bfloat16"
+  }
+}
