@@ -1,7 +1,9 @@
 import os
 import math
-import torch.nn.functional as F
 import json
+import itertools
+import torch
+import torch.nn.functional as F
 from pathlib import Path
 from tqdm.auto import tqdm
 from datetime  import datetime, timezone
@@ -10,8 +12,8 @@ from recirculation.dataset import dataloader
 MODES = ["vanilla", "recirculated"]
 
 
-def score_window_nll(model, window_ids, window_mask, mode="vanilla"):
-    """Score valid next-token targets in one independent window.
+def score_batch_nll(model, window_batch, mode="vanilla"):
+    """Score valid next-token targets for a batch of windows.
 
     Run vanilla or Recirculation inference on the same input IDs and attention
     mask. Logits at each position predict the following token; the first token
@@ -20,35 +22,41 @@ def score_window_nll(model, window_ids, window_mask, mode="vanilla"):
 
     Args:
         model: RecirculatedGemma instance used for inference.
-        window_ids: 1-D token IDs for one window, initially on CPU.
-        window_mask: 1-D mask with 1 for present tokens, 0 for padding.
+        window_batch: a tuple of (window_ids, window_mask, document_idx, window_idx)
+            entries. The window_ids and window_mask are extracted for nll computation.
+            window_ids is a 1-D tensor containing token IDs for one window, initially
+            on CPU.
+            window_mask is a 1-D tensor containing mask with 1 for present tokens,
+            0 for padding.
+            The windows must have equal length so they can be stacked.
         mode: "vanilla" or "recirculated" inference.
 
     Returns:
-        A pair (summed NLL, scored-token count) for valid next-token targets.
+        A pair (total NLL, scored-token count) across all valid next-token targets
+        in the batch.
     """
 
-    # Add batch dimension and move to model device
-    window_ids = window_ids.unsqueeze(0).to(model.model.device)
-    window_mask = window_mask.unsqueeze(0).to(model.model.device)
+    # Extract ids, masks and move to model device
+    window_ids = torch.stack([window[0] for window in window_batch]).to(model.model.device)
+    window_mask = torch.stack([window[1] for window in window_batch]).to(model.model.device)
 
     if mode=="vanilla":
         logits, targets = model.vanilla_run(window_ids, window_mask)
     else:
         logits, targets = model.recirculated_run(window_ids, window_mask)
 
-    logits = logits[:, :-1, :].float()  # The final logits are predictions for the next token ID
-    targets = targets[:, 1:]            # The token IDs from the next token are targets of the previous final logits
-    mask = window_mask[:, 1:]           # The mask needs to be shifted accordingly
+    logits = logits[:, :-1, :].float()              # The final logits are predictions for the next token ID
+    targets = targets[:, 1:]                        # The token IDs from the next token are targets of the previous final logits
+    mask = window_mask[:, 1:]                       # The mask needs to be shifted accordingly
 
     log_probs = F.log_softmax(logits, dim=-1)
     nll = F.nll_loss(
-        log_probs.reshape(-1, log_probs.size(-1)),      # Expects [N, C]
-        targets.reshape(-1),                            # Expects [N]
+        log_probs.reshape(-1, log_probs.size(-1)),  # Expects [N, C]
+        targets.reshape(-1),                        # Expects [N]
         reduction="none"
     )
 
-    valid_nll = nll[mask.reshape(-1).bool()]    # Mask PAD tokens
+    valid_nll = nll[mask.reshape(-1).bool()]        # Mask PAD tokens
 
     return valid_nll.sum().item(), valid_nll.numel()
 
@@ -58,28 +66,30 @@ def evaluate_perplexity(
         checkpoint = None,
         document_limit=None,
         window_limit=None,
-        on_window=None
+        on_batch=None,
+        batch_size = 1
         ):
     """Evaluate vanilla and Recirculation perplexity on paired PG-19 windows.
 
-    Score both modes on the same windows and valid target positions.
-    When resuming, continue after the checkpoint's last completed window and add
-    new scores to its cumulative totals.
+    Score both modes on the same valid next-token targets, grouping consecutive
+    equal-length windows into batches. Each completed batch contributes to the
+    cumulative totals and, if a callback is provided, to the checkpoint. On
+    resume, continue after the checkpoint's last completed window.
 
     Args:
         model: RecirculatedGemma instance, including its tokenizer.
         dataloader_config: Keyword arguments for dataloader, excluding tokenizer,
             resume indices, and document_limit.
-        checkpoint: Saved checkpoint object with a last-window cursor and
-            cumulative results, or None for a fresh run. Its NLL and token-count
-            dictionaries are updated in place.
+        checkpoint: Saved last-window cursor and cumulative results, or None for
+            a fresh run. Its values initialize the totals; it is not modified.
         document_limit: Cap on documents from the start of the split, or None
             for the full split.
         window_limit: Maximum additional windows to score in this invocation,
             or None to score all remaining selected windows.
-        on_window: Optional callback called after both modes complete a window.
-            Receives (document_idx, window_idx, total_nll_sum, total_tokens,
-            total_documents, total_windows).
+        on_batch: Optional callback called after both modes complete a batch.
+            Receives the last window's (document_idx, window_idx), followed by
+            cumulative NLL sums, token counts, document count, and window count.
+        batch_size: Maximum number of independent windows scored together.
 
     Returns:
         A seven-item tuple containing, in order:
@@ -103,7 +113,6 @@ def evaluate_perplexity(
         total_tokens = {mode: 0 for mode in MODES}
         total_windows = 0
         total_documents = 0
-        start_windows = 0
         start_window_idx = 0
         start_document_idx = 0
         last_scored_document_idx = None
@@ -112,7 +121,6 @@ def evaluate_perplexity(
         total_tokens = checkpoint["results"]["total_tokens"]
         total_windows = checkpoint["results"]["total_windows"]
         total_documents = checkpoint["results"]["total_documents"]
-        start_windows = checkpoint["results"]["total_windows"]
 
         document_idx = checkpoint["last_document_idx"]
         window_idx = checkpoint["last_window_idx"]
@@ -120,37 +128,50 @@ def evaluate_perplexity(
         start_window_idx = window_idx + 1
         last_scored_document_idx = checkpoint["last_document_idx"]
 
+    windows = dataloader(
+        tokenizer=model.tokenizer,
+        start_document_idx=start_document_idx,
+        start_window_idx=start_window_idx,
+        document_limit=document_limit,
+        **dataloader_config
+    )
 
-    for window_ids, window_mask, document_idx, window_idx in tqdm(
-        dataloader(
-            tokenizer=model.tokenizer,
-            start_document_idx=start_document_idx,
-            start_window_idx=start_window_idx,
-            document_limit=document_limit,
-            **dataloader_config
-            ),
-        desc="PG-19 · vanilla + recirc",
-        unit=" window",
-        dynamic_ncols=True,
-        ):
+    if window_limit is not None:
+        windows = itertools.islice(windows, window_limit)
+
+    for batch in itertools.batched(
+        tqdm(
+            windows,
+            desc="PG-19 · vanilla + recirc",
+            unit=" window",
+            dynamic_ncols=True,
+        ),
+        batch_size):
+        nll_sum = {}
+        num_tokens = {}
+
+        # Score the batches 
         for mode in MODES:
-            nll_sum, num_tokens = score_window_nll(
+            nll_sum[mode], num_tokens[mode] = score_batch_nll(
                 model=model,
-                window_ids=window_ids,
-                window_mask=window_mask,
+                window_batch=batch,
                 mode=mode
             )
-            total_nll_sum[mode] += nll_sum
-            total_tokens[mode] += num_tokens
-        total_windows += 1
-        if document_idx != last_scored_document_idx:
-            total_documents += 1
-            last_scored_document_idx = document_idx
-        if on_window is not None:
-            on_window(document_idx, window_idx, total_nll_sum, total_tokens, total_documents, total_windows)
-        if window_limit is not None and total_windows == window_limit + start_windows:
-            print(f"Reached {window_limit} windows, stopping evaluation at document {document_idx}, window {window_idx}")
-            break
+        # After all modes are successful register the results
+        total_nll_sum = {mode: total_nll_sum[mode] + nll_sum[mode] for mode in MODES}
+        total_tokens = {mode: total_tokens[mode] + num_tokens[mode] for mode in MODES}
+        total_windows += len(batch)
+
+        # Increment total_documents evaluated
+        for _, _, document_idx, window_idx in batch:
+            if document_idx != last_scored_document_idx:
+                total_documents += 1
+                last_scored_document_idx = document_idx
+
+        # Execute callback if provided, e.g. checkpoint saving
+        if on_batch is not None:
+            on_batch(document_idx, window_idx, total_nll_sum, total_tokens, total_documents, total_windows)
+
 
     if total_tokens["vanilla"] != total_tokens["recirculated"]:
         raise ValueError(f"Scored-token counts differ: {total_tokens}")
@@ -190,6 +211,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume-from", type=Path, help="Saved run JSON")
     parser.add_argument("--document-limit", type=int, default=None, help="Limits the full dataset to the first document_limit documents")
     parser.add_argument("--window-limit", type=int, help="Limits the evaluation run to window_limit windows")
+    parser.add_argument("--batch-size", type=int, help="Determines the batch size for evaluation")
     args = parser.parse_args()
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
@@ -208,9 +230,14 @@ if __name__ == "__main__":
 
     document_limit = args.document_limit
     window_limit = args.window_limit
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    batch_size =  args.batch_size if args.batch_size is not None else 1
+    if previous_run is not None and batch_size != previous_run.get("batch_size", 1):
+        # For example BF16 scores may differ slightly with batch_size
+        parser.error("--batch-size must match the saved run")
 
-    # Load model
-    import torch
+    # Load model    
     from recirculation.recirculated_gemma import RecirculatedGemma
 
     started_at = datetime.now(timezone.utc).isoformat()
@@ -236,6 +263,7 @@ if __name__ == "__main__":
         "model_parameters": model_config,
         "window_limit": window_limit,
         "document_limit": document_limit,
+        "batch_size": batch_size,
         "checkpoint": None,
         "provenance": {
             "git_commit": subprocess.check_output(
@@ -258,7 +286,7 @@ if __name__ == "__main__":
         f"{dataset_name}-{model_name}-{started_at.replace(':', '-')}.json"
     )
 
-    def record_window(document_idx, window_idx, total_nll_sum, total_tokens, total_documents, total_windows):
+    def record_batch(document_idx, window_idx, total_nll_sum, total_tokens, total_documents, total_windows):
         if total_tokens["vanilla"] != total_tokens["recirculated"]:
             raise ValueError(f"Scored-token counts differ: {total_tokens}")
 
@@ -286,7 +314,8 @@ if __name__ == "__main__":
         checkpoint=checkpoint,
         document_limit=document_limit,
         window_limit=window_limit,
-        on_window=record_window
+        on_batch=record_batch,
+        batch_size=batch_size
     )
 
     # Save metadata
@@ -297,6 +326,6 @@ if __name__ == "__main__":
 
     save_run_metadata(metadata, output)
 
-    print(f"Evaluation ran for {total_windows} windows and {total_tokens["vanilla"]} tokens\n")
+    print(f"Evaluation ran for {total_windows} windows and {total_tokens["vanilla"]} tokens\nStopped at document {document_idx} and window {window_idx}\n")
     for mode in MODES:
         print(f"Perplexity {mode} \t: {perplexity[mode]}")
