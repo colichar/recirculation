@@ -20,11 +20,11 @@ class FakeModel:
 
     def vanilla_run(self, input_ids, attention_mask):
         self.calls.append(("vanilla", input_ids.clone(), attention_mask.clone()))
-        return self.vanilla_logits[tuple(input_ids[0].tolist())].unsqueeze(0), input_ids
+        return torch.stack([self.vanilla_logits[tuple(row.tolist())] for row in input_ids]), input_ids
 
     def recirculated_run(self, input_ids, attention_mask):
         self.calls.append(("recirculation", input_ids.clone(), attention_mask.clone()))
-        return self.recirculated_logits[tuple(input_ids[0].tolist())].unsqueeze(0), input_ids
+        return torch.stack([self.recirculated_logits[tuple(row.tolist())] for row in input_ids]), input_ids
 
 
 def test_window_nll_shifts_targets_and_excludes_padded_positions_in_both_modes():
@@ -40,8 +40,9 @@ def test_window_nll_shifts_targets_and_excludes_padded_positions_in_both_modes()
     recirculated[1] = torch.tensor([3, 0, 0])
     model = FakeModel({tuple(ids.tolist()): vanilla}, {tuple(ids.tolist()): recirculated})
 
-    vanilla_sum, vanilla_count = evaluation_module.score_window_nll(model, ids, mask, mode="vanilla")
-    recirc_sum, recirc_count = evaluation_module.score_window_nll(model, ids, mask, mode="recirculated")
+    batch = ((ids, mask, 0, 0),)
+    vanilla_sum, vanilla_count = evaluation_module.score_batch_nll(model, batch, mode="vanilla")
+    recirc_sum, recirc_count = evaluation_module.score_batch_nll(model, batch, mode="recirculated")
 
     correct_loss = math.log1p(2 * math.exp(-3))
     assert vanilla_count == recirc_count == 2
@@ -64,10 +65,41 @@ def test_window_nll_without_bos_excludes_first_text_token():
     ], dtype=torch.float32)
     model = FakeModel({tuple(ids.tolist()): logits})
 
-    nll_sum, count = evaluation_module.score_window_nll(model, ids, mask)
+    nll_sum, count = evaluation_module.score_batch_nll(model, ((ids, mask, 0, 0),))
 
     assert count == 2
     assert nll_sum == pytest.approx(2 * math.log1p(3 * math.exp(-8)), abs=1e-6)
+
+
+def test_batch_scores_same_targets_as_independent_windows():
+    ids_a = torch.tensor([0, 1, 2, 1])
+    ids_b = torch.tensor([2, 2, 1, 0])
+    mask = torch.ones(4, dtype=torch.long)
+    windows = ((ids_a, mask, 0, 0), (ids_b, mask, 1, 0))
+    logits = {
+        tuple(ids_a.tolist()): torch.tensor([[0, 3, 0], [0, 0, 3], [0, 3, 0], [10, 0, 0]], dtype=torch.bfloat16),
+        tuple(ids_b.tolist()): torch.tensor([[0, 0, 2], [0, 2, 0], [2, 0, 0], [0, 10, 0]], dtype=torch.bfloat16),
+    }
+    recirculated = {key: value.clone() for key, value in logits.items()}
+    recirculated[tuple(ids_b.tolist())][1] = torch.tensor([2, 0, 0])
+    model = FakeModel(logits, recirculated)
+
+    for mode, mode_logits in (("vanilla", logits), ("recirculated", recirculated)):
+        single_scores = [evaluation_module.score_batch_nll(model, (window,), mode) for window in windows]
+        batch_sum, batch_count = evaluation_module.score_batch_nll(model, windows, mode)
+        target_nll = [
+            -torch.log_softmax(mode_logits[tuple(ids.tolist())][:-1].float(), dim=-1)
+            .gather(1, ids[1:, None]).flatten()
+            for ids, _, _, _ in windows
+        ]
+        assert batch_count == sum(count for _, count in single_scores) == 6
+        assert batch_sum == pytest.approx(sum(score for score, _ in single_scores), abs=1e-6)
+        assert batch_sum == pytest.approx(torch.cat(target_nll).sum().item(), abs=1e-6)
+
+    for mode, seen_ids, seen_mask in model.calls:
+        torch.testing.assert_close(seen_mask, torch.ones_like(seen_ids))
+        if seen_ids.shape[0] == 2:
+            torch.testing.assert_close(seen_ids, torch.stack([ids_a, ids_b]))
 
 
 def test_perplexity_weights_windows_by_valid_token_count(monkeypatch):
@@ -120,20 +152,84 @@ def test_perplexity_weights_windows_by_valid_token_count(monkeypatch):
             torch.testing.assert_close(seen_mask, mask.unsqueeze(0))
 
 
+def test_batches_cross_documents_and_window_limit_keeps_partial_batch(monkeypatch):
+    # Document 2 yields no windows; it must not count as a scored document.
+    windows = [
+        (torch.tensor([0, 1, 2, 1]), torch.ones(4, dtype=torch.long), doc, idx)
+        for doc, idx in ((0, 0), (0, 1), (1, 0), (3, 0), (3, 1))
+    ]
+    # Distinguish windows in the same document so an incorrect shared row is visible.
+    windows[1] = (torch.tensor([0, 2, 1, 2]), windows[1][1], 0, 1)
+    windows[2] = (torch.tensor([1, 2, 0, 1]), windows[2][1], 1, 0)
+    windows[3] = (torch.tensor([2, 0, 1, 2]), windows[3][1], 3, 0)
+    windows[4] = (torch.tensor([2, 1, 0, 2]), windows[4][1], 3, 1)
+    logits = {
+        tuple(ids.tolist()): torch.tensor([[0., 1., 2.], [2., 0., 1.], [1., 2., 0.], [0., 0., 0.]]) + i * 0.1
+        for i, (ids, _, _, _) in enumerate(windows)
+    }
+    recirculated = {key: value + torch.tensor([0.2, 0., -0.2]) for key, value in logits.items()}
+    model = FakeModel(logits, recirculated)
+
+    def dataloader(*, tokenizer, start_document_idx, start_window_idx, document_limit):
+        assert tokenizer is model.tokenizer
+        for window in windows:
+            if window[2] >= start_document_idx and window[2] < document_limit:
+                if window[2] != start_document_idx or window[3] >= start_window_idx:
+                    yield window
+
+    monkeypatch.setattr(evaluation_module, "dataloader", dataloader)
+
+    reference = evaluation_module.evaluate_perplexity(model, {}, document_limit=4, batch_size=1)
+    completed_batches = []
+    batched = evaluation_module.evaluate_perplexity(
+        model, {}, document_limit=4, batch_size=3,
+        on_batch=lambda *args: completed_batches.append((args[0], args[1], args[4], args[5])),
+    )
+    assert batched[2:] == reference[2:] == ({"vanilla": 15, "recirculated": 15}, 3, 5, 3, 1)
+    for mode in evaluation_module.MODES:
+        assert batched[1][mode] == pytest.approx(reference[1][mode], abs=1e-5)
+    assert completed_batches == [(1, 0, 2, 3), (3, 1, 3, 5)]
+
+    limited_batches = []
+    limited = evaluation_module.evaluate_perplexity(
+        model, {}, document_limit=4, batch_size=3, window_limit=4,
+        on_batch=lambda *args: limited_batches.append((args[0], args[1], args[5])),
+    )
+    assert limited_batches == [(1, 0, 3), (3, 0, 4)]
+    assert (limited[2], limited[3], limited[4], limited[5:]) == (
+        {"vanilla": 12, "recirculated": 12}, 3, 4, (3, 0),
+    )
+    checkpoint = {
+        "last_document_idx": limited[5],
+        "last_window_idx": limited[6],
+        "results": {
+            "total_nll_sum": limited[1].copy(),
+            "total_tokens": limited[2].copy(),
+            "total_documents": limited[3],
+            "total_windows": limited[4],
+        },
+    }
+    resumed = evaluation_module.evaluate_perplexity(model, {}, document_limit=4, batch_size=3, checkpoint=checkpoint)
+    assert resumed[2:] == batched[2:]
+    for mode in evaluation_module.MODES:
+        assert resumed[1][mode] == pytest.approx(batched[1][mode], abs=1e-5)
+
+
 def test_checkpoint_after_interruption_resumes_across_documents(monkeypatch, tmp_path):
     documents = [document([1, 2, 3, 4]), document([5, 6])]
     monkeypatch.setattr(dataset_module, "load_dataset", lambda *args, **kwargs: Documents(documents))
     model = SimpleNamespace(tokenizer=Tokenizer())
     seen = []
 
-    def score_window_nll(model, window_ids, window_mask, mode):
-        seen.append((tuple(window_ids.tolist()), mode))
-        return float(window_ids[1]) + (0.5 if mode == "recirculated" else 0), int(window_mask[1:].sum())
+    def score_batch_nll(model, window_batch, mode):
+        seen.append((tuple(tuple(ids.tolist()) for ids, _, _, _ in window_batch), mode))
+        return (sum(float(ids[1]) + (0.5 if mode == "recirculated" else 0) for ids, _, _, _ in window_batch),
+                sum(int(mask[1:].sum()) for _, mask, _, _ in window_batch))
 
-    monkeypatch.setattr(evaluation_module, "score_window_nll", score_window_nll)
+    monkeypatch.setattr(evaluation_module, "score_batch_nll", score_batch_nll)
     output = tmp_path / "checkpoint.json"
 
-    def save_window(document_idx, window_idx, nll_sums, counts, documents_count, windows_count):
+    def save_batch(document_idx, window_idx, nll_sums, counts, documents_count, windows_count):
         evaluation_module.save_run_metadata({"checkpoint": {
             "last_document_idx": document_idx,
             "last_window_idx": window_idx,
@@ -149,7 +245,7 @@ def test_checkpoint_after_interruption_resumes_across_documents(monkeypatch, tmp
 
     with pytest.raises(RuntimeError, match="interrupted after checkpoint"):
         evaluation_module.evaluate_perplexity(
-            model, {"window_size": 2}, on_window=save_window
+            model, {"window_size": 2}, batch_size=2, on_batch=save_batch
         )
 
     assert not output.with_name(output.name + ".tmp").exists()
@@ -158,17 +254,18 @@ def test_checkpoint_after_interruption_resumes_across_documents(monkeypatch, tmp
     assert (checkpoint["results"]["total_documents"], checkpoint["results"]["total_windows"]) == (1, 2)
     assert checkpoint["results"]["total_tokens"] == {"vanilla": 4, "recirculated": 4}
 
-    resumed_windows = []
+    resumed_batches = []
     resumed = evaluation_module.evaluate_perplexity(
-        model, {"window_size": 2}, checkpoint=checkpoint, on_window=lambda *args: resumed_windows.append(args[:2])
+        model, {"window_size": 2}, batch_size=2, checkpoint=checkpoint,
+        on_batch=lambda *args: resumed_batches.append(args[:2]),
     )
-    assert resumed_windows == [(1, 0)]
-    uninterrupted = evaluation_module.evaluate_perplexity(model, {"window_size": 2})
+    assert resumed_batches == [(1, 0)]
+    uninterrupted = evaluation_module.evaluate_perplexity(model, {"window_size": 2}, batch_size=2)
     assert resumed == uninterrupted
     assert (resumed[3], resumed[4], resumed[5:]) == (2, 3, (1, 0))
-    assert len(seen) == 12  # 2 modes for 2 + 1 + 3 windows
+    assert len(seen) == 8  # 2 modes for 1 + 1 + 2 batches
 
-    no_more_windows = []
+    no_more_batches = []
     final_checkpoint = {
         "last_document_idx": resumed[5],
         "last_window_idx": resumed[6],
@@ -180,31 +277,32 @@ def test_checkpoint_after_interruption_resumes_across_documents(monkeypatch, tmp
         },
     }
     assert evaluation_module.evaluate_perplexity(
-        model, {"window_size": 2}, checkpoint=final_checkpoint,
-        on_window=lambda *args: no_more_windows.append(args)
+        model, {"window_size": 2}, batch_size=2, checkpoint=final_checkpoint,
+        on_batch=lambda *args: no_more_batches.append(args)
     ) == uninterrupted
-    assert no_more_windows == []
+    assert no_more_batches == []
 
 
-def test_failed_second_mode_keeps_last_complete_window_checkpoint(monkeypatch, tmp_path):
+def test_failed_second_mode_keeps_last_complete_batch_checkpoint(monkeypatch, tmp_path):
     monkeypatch.setattr(
         dataset_module, "load_dataset",
-        lambda *args, **kwargs: Documents([document([1, 2, 3, 4])]),
+        lambda *args, **kwargs: Documents([document(range(1, 9)), document([9, 10])]),
     )
     model = SimpleNamespace(tokenizer=Tokenizer())
-    fail_on_second_window = True
+    fail_on_second_batch = True
 
-    def score_window_nll(model, window_ids, window_mask, mode):
-        if fail_on_second_window and window_ids[1].item() == 3 and mode == "recirculated":
+    def score_batch_nll(model, window_batch, mode):
+        if fail_on_second_batch and mode == "recirculated" and any(ids[1].item() == 5 for ids, _, _, _ in window_batch):
             raise RuntimeError("recirculation failed")
-        return float(window_ids[1]) + (0.5 if mode == "recirculated" else 0), int(window_mask[1:].sum())
+        return (sum(float(ids[1]) + (0.5 if mode == "recirculated" else 0) for ids, _, _, _ in window_batch),
+                sum(int(mask[1:].sum()) for _, mask, _, _ in window_batch))
 
-    monkeypatch.setattr(evaluation_module, "score_window_nll", score_window_nll)
+    monkeypatch.setattr(evaluation_module, "score_batch_nll", score_batch_nll)
     output = tmp_path / "checkpoint.json"
-    saved_windows = []
+    saved_batches = []
 
-    def save_window(document_idx, window_idx, nll_sums, counts, documents_count, windows_count):
-        saved_windows.append((document_idx, window_idx))
+    def save_batch(document_idx, window_idx, nll_sums, counts, documents_count, windows_count):
+        saved_batches.append((document_idx, window_idx))
         evaluation_module.save_run_metadata({"checkpoint": {
             "last_document_idx": document_idx,
             "last_window_idx": window_idx,
@@ -217,20 +315,20 @@ def test_failed_second_mode_keeps_last_complete_window_checkpoint(monkeypatch, t
         }}, output)
 
     with pytest.raises(RuntimeError, match="recirculation failed"):
-        evaluation_module.evaluate_perplexity(model, {"window_size": 2}, on_window=save_window)
+        evaluation_module.evaluate_perplexity(model, {"window_size": 2}, batch_size=2, on_batch=save_batch)
 
     checkpoint = json.loads(output.read_text())["checkpoint"]
-    assert saved_windows == [(0, 0)]
-    assert (checkpoint["last_document_idx"], checkpoint["last_window_idx"]) == (0, 0)
-    assert checkpoint["results"]["total_nll_sum"] == {"vanilla": 1.0, "recirculated": 1.5}
-    assert checkpoint["results"]["total_tokens"] == {"vanilla": 2, "recirculated": 2}
-    assert checkpoint["results"]["total_windows"] == checkpoint["results"]["total_documents"] == 1
+    assert saved_batches == [(0, 1)]
+    assert (checkpoint["last_document_idx"], checkpoint["last_window_idx"]) == (0, 1)
+    assert checkpoint["results"]["total_nll_sum"] == {"vanilla": 4.0, "recirculated": 5.0}
+    assert checkpoint["results"]["total_tokens"] == {"vanilla": 4, "recirculated": 4}
+    assert (checkpoint["results"]["total_windows"], checkpoint["results"]["total_documents"]) == (2, 1)
 
-    fail_on_second_window = False
-    resumed = evaluation_module.evaluate_perplexity(model, {"window_size": 2}, checkpoint=checkpoint)
-    uninterrupted = evaluation_module.evaluate_perplexity(model, {"window_size": 2})
+    fail_on_second_batch = False
+    resumed = evaluation_module.evaluate_perplexity(model, {"window_size": 2}, batch_size=2, checkpoint=checkpoint)
+    uninterrupted = evaluation_module.evaluate_perplexity(model, {"window_size": 2}, batch_size=2)
     assert resumed == uninterrupted
-    assert (resumed[5], resumed[6]) == (0, 1)
+    assert (resumed[3], resumed[4], resumed[5:]) == (2, 5, (1, 0))
 
 
 def test_first_only_resume_within_and_across_documents_matches_full_run(monkeypatch):
@@ -239,10 +337,11 @@ def test_first_only_resume_within_and_across_documents_matches_full_run(monkeypa
     model = SimpleNamespace(tokenizer=Tokenizer())
     config = {"window_size": 40, "window_prefix": "first_only"}
 
-    def score_window_nll(model, window_ids, window_mask, mode):
-        return float(window_ids[1]) + (0.5 if mode == "recirculated" else 0), int(window_mask[1:].sum())
+    def score_batch_nll(model, window_batch, mode):
+        return (sum(float(ids[1]) + (0.5 if mode == "recirculated" else 0) for ids, _, _, _ in window_batch),
+                sum(int(mask[1:].sum()) for _, mask, _, _ in window_batch))
 
-    monkeypatch.setattr(evaluation_module, "score_window_nll", score_window_nll)
+    monkeypatch.setattr(evaluation_module, "score_batch_nll", score_batch_nll)
 
     def checkpoint(result):
         _, nll_sums, counts, document_count, window_count, document_idx, window_idx = result
@@ -257,10 +356,10 @@ def test_first_only_resume_within_and_across_documents_matches_full_run(monkeypa
             },
         }
 
-    first = evaluation_module.evaluate_perplexity(model, config, window_limit=1)
-    second = evaluation_module.evaluate_perplexity(model, config, checkpoint=checkpoint(first), window_limit=1)
-    completed = evaluation_module.evaluate_perplexity(model, config, checkpoint=checkpoint(second))
-    full = evaluation_module.evaluate_perplexity(model, config)
+    first = evaluation_module.evaluate_perplexity(model, config, batch_size=2, window_limit=1)
+    second = evaluation_module.evaluate_perplexity(model, config, batch_size=2, checkpoint=checkpoint(first), window_limit=1)
+    completed = evaluation_module.evaluate_perplexity(model, config, batch_size=2, checkpoint=checkpoint(second))
+    full = evaluation_module.evaluate_perplexity(model, config, batch_size=2)
 
     assert (first[3], first[4], first[5:]) == (1, 1, (0, 0))
     assert (second[3], second[4], second[5:]) == (1, 2, (0, 1))
