@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -115,11 +116,84 @@ def test_evaluate_gsm8k_keeps_reasoning_and_answers_paired_by_mode(monkeypatch):
 
     monkeypatch.setattr(evaluation, "generate", generate)
 
-    assert evaluation.evaluate_gsm8k(object(), reasoning_limit=123, answering_limit=17) == {
-        "vanilla": 0.5,
-        "recirculated": 1.0,
-    }
+    assert evaluation.evaluate_gsm8k(
+        object(), dataloader_config={}, reasoning_limit=123, answering_limit=17
+    ) == (
+        {"vanilla": 0.5, "recirculated": 1.0},
+        {"vanilla": 1, "recirculated": 2},
+        {"vanilla": 2, "recirculated": 2},
+    )
     assert [(mode, limit) for _, mode, limit in calls] == [
         ("vanilla", 123), ("vanilla", 17),
         ("recirculated", 123), ("recirculated", 17),
     ] * len(samples)
+
+
+def test_evaluate_gsm8k_resume_matches_uninterrupted_run(monkeypatch):
+    samples = [
+        (0, "First question?", "1"),
+        (1, "Second question?", "2"),
+        (2, "Third question?", "3"),
+    ]
+    monkeypatch.setattr(evaluation, "dataloader_gsm8k", lambda **kwargs: iter(samples))
+    calls = []
+    answers = {
+        (0, "vanilla"): "1", (0, "recirculated"): "wrong",
+        (1, "vanilla"): "wrong", (1, "recirculated"): "2",
+        (2, "vanilla"): "3", (2, "recirculated"): "wrong",
+    }
+
+    def generate(*, model, prompt, mode, max_new_tokens):
+        index = next(i for i, question, _ in samples if question in prompt)
+        stage = "answer" if "Therefore, the answer (arabic numerals) is" in prompt else "reasoning"
+        calls.append((index, mode, stage))
+        return answers[(index, mode)] if stage == "answer" else f"{mode} reasoning"
+
+    monkeypatch.setattr(evaluation, "generate", generate)
+    checkpoints = []
+
+    def save_checkpoint(*, processed_questions, correct_answers):
+        checkpoints.append({
+            "results": {
+                "processed_questions": processed_questions.copy(),
+                "correct_answers": correct_answers.copy(),
+            }
+        })
+
+    first = evaluation.evaluate_gsm8k(
+        object(), dataloader_config={}, question_limit=1, on_batch=save_checkpoint
+    )
+    assert first == (
+        {"vanilla": 1.0, "recirculated": 0.0},
+        {"vanilla": 1, "recirculated": 0},
+        {"vanilla": 1, "recirculated": 1},
+    )
+    assert checkpoints == [{
+        "results": {
+            "processed_questions": {"vanilla": 1, "recirculated": 1},
+            "correct_answers": {"vanilla": 1, "recirculated": 0},
+        }
+    }]
+
+    calls.clear()
+    # A restarted evaluator reads a fresh checkpoint object from the saved JSON.
+    reloaded_checkpoint = json.loads(json.dumps(checkpoints[-1]))
+    resumed = evaluation.evaluate_gsm8k(
+        object(), dataloader_config={}, checkpoint=reloaded_checkpoint,
+        question_limit=2, on_batch=save_checkpoint,
+    )
+    assert [index for index, _, stage in calls if stage == "reasoning"] == [1, 1, 2, 2]
+    assert [checkpoint["results"]["processed_questions"] for checkpoint in checkpoints] == [
+        {"vanilla": 1, "recirculated": 1},
+        {"vanilla": 2, "recirculated": 2},
+        {"vanilla": 3, "recirculated": 3},
+    ]
+
+    uninterrupted = evaluation.evaluate_gsm8k(
+        object(), dataloader_config={}, question_limit=3
+    )
+    assert resumed == uninterrupted == (
+        {"vanilla": 2 / 3, "recirculated": 1 / 3},
+        {"vanilla": 2, "recirculated": 1},
+        {"vanilla": 3, "recirculated": 3},
+    )
