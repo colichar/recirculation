@@ -1,5 +1,6 @@
 import re
 import os
+import json
 import itertools
 from tqdm.auto import tqdm
 from recirculation.dataset import dataloader_gsm8k
@@ -74,7 +75,13 @@ def evaluate_gsm8k(
     if question_limit is not None:
         dataset = itertools.islice(dataset, question_limit)
 
-    for _, question, answer in tqdm(dataset, desc="GSM8k", unit=" question", dynamic_ncols=True):
+    for sample_idx, question, answer in tqdm(dataset, desc="GSM8k", unit=" question", dynamic_ncols=True):
+        question_record = {
+            "sample_idx": sample_idx,
+            "question": question,
+            "reference_answer": answer,
+            "modes": {},
+        }
         for mode in MODES:
             formatted_reasoning_prompt = reasoning_prompt.format(question=question)
 
@@ -94,13 +101,26 @@ def evaluate_gsm8k(
                 max_new_tokens=answering_limit
             )
 
-            if extract_first_number(generated_answer) == answer:
+            extracted_answer = extract_first_number(generated_answer)
+            is_correct = extracted_answer == answer
+            question_record["modes"][mode] = {
+                "reasoning": generated_reasoning,
+                "answer": generated_answer,
+                "extracted_answer": extracted_answer,
+                "correct": is_correct,
+            }
+
+            if is_correct:
                 correct_answers[mode] += 1
 
             processed_questions[mode] += 1
 
         if on_batch is not None:
-            on_batch(processed_questions=processed_questions, correct_answers=correct_answers)
+            on_batch(
+                processed_questions=processed_questions,
+                correct_answers=correct_answers,
+                record=question_record,
+            )
 
     if processed_questions["vanilla"] != processed_questions["recirculated"]:
         raise ValueError(f"Scored-token counts differ: {processed_questions}")
@@ -130,9 +150,55 @@ def save_run_metadata(metadata, output):
     finally:
         temporary.unlink(missing_ok=True)
 
+def reconcile_generation_log(checkpoint, checkpoint_path):
+    """Trim generations beyond the last complete question saved in a checkpoint."""
+    if "generation_log" not in checkpoint:
+        raise ValueError("Cannot resume: checkpoint has no generation log; start a new logged run.")
+
+    processed_questions = checkpoint["results"]["processed_questions"]
+    if processed_questions["vanilla"] != processed_questions["recirculated"]:
+        raise ValueError(f"Question counts differ: {processed_questions}")
+
+    log_path = (checkpoint_path.parent / checkpoint["generation_log"]).resolve()
+    with log_path.open("r+b") as log:
+        for _ in range(processed_questions["vanilla"]):
+            line = log.readline()
+            if not line.endswith(b"\n"):
+                raise ValueError(f"Generation log has fewer complete questions than checkpoint: {log_path}")
+            json.loads(line)
+        log.truncate()
+
+    return log_path
+
+
+def save_question_checkpoint(metadata, output, processed_questions, correct_answers, record, log_path=None):
+    """Append a completed question's generations before saving its score checkpoint."""
+    if processed_questions["vanilla"] != processed_questions["recirculated"]:
+        raise ValueError(f"Question counts differ: {processed_questions}")
+
+    if log_path is None:
+        log_path = output.with_suffix(".jsonl")
+    output.parent.mkdir(exist_ok=True)
+    with log_path.open("ab") as log:
+        log.write((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8"))
+        log.flush()
+        os.fsync(log.fileno())
+
+    metadata["checkpoint"] = {
+        "generation_log": os.path.relpath(log_path, output.parent),
+        "results": {
+            "pass@1": {
+                mode: correct_answers[mode] / processed_questions[mode]
+                for mode in MODES
+            },
+            "correct_answers": correct_answers.copy(),
+            "processed_questions": processed_questions.copy(),
+        },
+    }
+    save_run_metadata(metadata, output)
+
 if __name__ == "__main__":
     import argparse
-    import json
     import torch
     from pathlib import Path
     from datetime import datetime, timezone
@@ -186,6 +252,7 @@ if __name__ == "__main__":
                 raise ValueError(f"Cannot resume: {section} differs from the saved run.")
 
     checkpoint = previous_run["checkpoint"] if previous_run is not None else None
+    resume_log = reconcile_generation_log(checkpoint, args.resume_from) if checkpoint is not None else None
 
     # Load model instance
     started_at = datetime.now(timezone.utc).isoformat()
@@ -234,21 +301,8 @@ if __name__ == "__main__":
         f"{dataset_name}-{evaluation_mode}-{model_name}-{started_at.replace(':', '-')}.json"
     )
 
-    def record_batch(processed_questions, correct_answers):
-        if processed_questions["vanilla"] != processed_questions["recirculated"]:
-            raise ValueError(f"Scored-token counts differ: {processed_questions}")
-
-        metadata["checkpoint"] = {
-            "results": {
-                "pass@1": {
-                    mode: correct_answers[mode] / processed_questions[mode]
-                    for mode in MODES
-                },
-                "correct_answers": correct_answers,
-                "processed_questions": processed_questions,
-            },
-        }
-        save_run_metadata(metadata, output)
+    def record_batch(processed_questions, correct_answers, record):
+        save_question_checkpoint(metadata, output, processed_questions, correct_answers, record, log_path=resume_log)
 
     # Run evaluation
     if evaluation_config["mode"] == "pass@1":
@@ -267,7 +321,9 @@ if __name__ == "__main__":
         raise ValueError("Unknown evaluation mode.")
 
     if metadata["checkpoint"] is None:
-        metadata["checkpoint"] = checkpoint
+        metadata["checkpoint"] = checkpoint.copy() if checkpoint is not None else None
+        if checkpoint is not None:
+            metadata["checkpoint"]["generation_log"] = os.path.relpath(resume_log, output.parent)
 
     metadata["meta"]["finished_at"] = datetime.now(timezone.utc).isoformat()
 
