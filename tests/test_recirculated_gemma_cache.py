@@ -1,5 +1,6 @@
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -73,7 +74,10 @@ def tiny_gemma(monkeypatch, request, model_layout):
         torch.manual_seed(7)
         model = AutoModelForCausalLM.from_config(config, attn_implementation="eager").eval()
     # Exercise the real wrapper initialization without downloading weights or a tokenizer.
-    monkeypatch.setattr(module.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module.AutoTokenizer, "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(eos_token_id=-1),
+    )
     def load_model(*args, **kwargs):
         assert kwargs["torch_dtype"] == dtype
         return model.to(device=device, dtype=kwargs["torch_dtype"])
@@ -636,3 +640,33 @@ def test_recirculated_generate_resets_state_between_requests(tiny_gemma):
 
     assert_logits_close(first_logits, second_logits)
     torch.testing.assert_close(first_ids, second_ids, rtol=0, atol=0)
+
+
+@execution_cases
+@pytest.mark.parametrize("forced_ids", [[1], [3, 1], [3, 3, 3]])
+def test_recirculated_generate_stops_at_eos_or_token_limit(
+    tiny_gemma, monkeypatch, forced_ids
+):
+    tiny_gemma.tokenizer.eos_token_id = 1
+    input_ids = torch.tensor([[2, 4, 5]], device=tiny_gemma.model.device)
+    attention_mask = torch.ones_like(input_ids)
+    original_head = tiny_gemma.model.lm_head.forward
+    calls = []
+
+    def force_next_token(*args, **kwargs):
+        logits = original_head(*args, **kwargs)
+        token_id = forced_ids[len(calls)]
+        calls.append(token_id)
+        logits = torch.full_like(logits, -1000)
+        logits[..., token_id] = 0
+        return logits
+
+    monkeypatch.setattr(tiny_gemma.model.lm_head, "forward", force_next_token)
+    logits, ids = tiny_gemma.recirculated_generate(
+        input_ids, attention_mask, max_new_tokens=3
+    )
+
+    assert calls == forced_ids
+    assert ids.tolist() == [forced_ids]
+    assert logits.shape == (1, len(forced_ids), tiny_gemma.model_config.vocab_size)
+    assert logits.argmax(dim=-1).tolist() == [forced_ids]

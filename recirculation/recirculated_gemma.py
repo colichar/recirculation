@@ -314,6 +314,10 @@ class RecirculatedGemma:
             max_new_tokens=10,
             K=1
         ):
+        """Greedily generate until <eos> or max_new_tokens for one sequence."""
+        if input_ids.shape[0] != 1:
+            raise ValueError("EOS stopping in recirculated_generate requires batch size 1")
+
         generated_logits = []
         generated_ids = []
 
@@ -357,6 +361,9 @@ class RecirculatedGemma:
 
             ## Iterative next token prediction
             for _ in range(max_new_tokens-1):
+                if next_token_id.item() == self.tokenizer.eos_token_id:
+                    break
+
                 # Write an iterative method for autoregressive_prediction `autoregressive_run`
                 input_sequence_len = input_ids.shape[1]
 
@@ -477,10 +484,29 @@ class RecirculatedGemma:
     def vanilla_run(self, input_ids, attention_mask=None):
         with torch.no_grad():
             outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_hidden_states=False,
-                        use_cache=False,
-                    )
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                use_cache=False,
+            )
 
         return outputs.logits, input_ids
+
+    def vanilla_generate(self, input_ids, attention_mask, max_new_tokens=10000):
+        """Greedily generate tokens, stopping at <eos> or the token limit."""
+        with torch.no_grad():
+            output = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,            # Greedy decoding
+                num_beams=1,                # Greedy decoding
+                use_cache=True,
+                eos_token_id=self.tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_logits=True,
+            )
+
+        generated_logits = torch.stack(output.logits, dim=1)
+        generated_ids = output.sequences[:, input_ids.shape[1]:]
+        return generated_logits, generated_ids
