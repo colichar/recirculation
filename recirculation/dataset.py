@@ -125,3 +125,18 @@ def dataloader(
             window_mask = F.pad(window_mask, (0, (window_size + 1) - leftover_tokens), value=0)
 
             yield window_ids, window_mask, document_idx, num_of_full_windows
+
+
+def dataloader_gsm8k(split="test", revision="740312add88f781978c0658806c59bc2815b9866"):
+    dataset = load_dataset(
+        "openai/gsm8k",
+        "main",
+        split=split,
+        revision=revision,
+    )
+
+    # Temporary only
+    dataset = dataset.take(5)
+
+    for sample_idx, sample in enumerate(dataset):
+        yield sample_idx, sample["question"], sample["answer"].rsplit("####", 1)[1].strip().replace(",", "")
